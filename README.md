@@ -178,16 +178,38 @@ ssl_keyfile = "/etc/ssl/private/smtp-relay.key"
 | `api.ssl_certfile` | Server certificate chain. Its presence enables TLS. |
 | `api.ssl_keyfile` | Private key. Omit if the key is appended to the cert file. |
 | `api.ssl_keyfile_password` | Passphrase for an encrypted key. Prefer `RELAY_API_SSL_KEYFILE_PASSWORD`. |
-| `api.ssl_ca_certs` | Client CA bundle, for mutual TLS. |
-| `api.ssl_cert_reqs` | `none` \| `optional` \| `required` — mapped to `ssl.VerifyMode` for uvicorn. |
+| `api.ssl_ca_certs` | Client CA bundle, for mutual TLS. Must be paired with `ssl_cert_reqs`. |
+| `api.ssl_cert_reqs` | `none` \| `optional` \| `required` — mapped to `ssl.VerifyMode` for uvicorn. `optional`/`required` must be paired with `ssl_ca_certs`. |
 
-Setting any `ssl_*` key other than `ssl_certfile` without `ssl_certfile` is a
-configuration error, caught at startup rather than inside uvicorn.
+Two things are rejected at startup rather than failing obscurely later:
+
+- Setting any `ssl_*` key other than `ssl_certfile` without `ssl_certfile` — TLS
+  would not be enabled at all.
+- Setting `ssl_ca_certs` and `ssl_cert_reqs` **without each other.** uvicorn sets
+  `verify_mode` unconditionally but loads the CA bundle only when `ssl_ca_certs` is
+  given, so each alone is broken in a different way: a CA bundle with no
+  `ssl_cert_reqs` leaves verification at `CERT_NONE` and never requests a client
+  certificate (mTLS silently inert), while `ssl_cert_reqs = "required"` with no CA
+  bundle verifies clients against an empty trust store and rejects everyone,
+  including valid clients.
 
 uvicorn negotiates with its defaults (TLS 1.2+, `PROTOCOL_TLS_SERVER`); `ssl_version`
-and `ssl_ciphers` are deliberately not exposed. Mutual TLS is available via
-`ssl_ca_certs` + `ssl_cert_reqs = "required"`, which lets you authenticate clients
-by certificate instead of, or as well as, the bearer token.
+and `ssl_ciphers` are deliberately not exposed.
+
+Mutual TLS authenticates clients by certificate instead of, or as well as, the
+bearer token:
+
+```toml
+[api]
+ssl_certfile = "/etc/ssl/certs/smtp-relay.crt"
+ssl_keyfile = "/etc/ssl/private/smtp-relay.key"
+ssl_ca_certs = "/etc/ssl/certs/client-ca.pem"
+ssl_cert_reqs = "required"
+```
+
+Clients then present a certificate chaining to `client-ca.pem`; anything else —
+no certificate, or one signed by a different CA — is refused during the TLS
+handshake, before any HTTP request is parsed.
 
 If you terminate TLS in a reverse proxy instead, leave `api.ssl_*` unset, keep
 `api.host = "127.0.0.1"`, and have the proxy forward to it.
@@ -232,7 +254,7 @@ encoding applied by every mail client, and is unrelated to the API-level rule ab
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest          # 119 tests
+.venv/bin/python -m pytest          # 132 tests
 ```
 
 Five layers:
@@ -245,12 +267,27 @@ Five layers:
 - **integration** (`test_integration.py`) — the whole stack against a real
   `aiosmtpd` server on an ephemeral port, asserting the message actually arrives
   with the right envelope and headers.
-- **API TLS** (`test_api_tls.py`) — the ssl config plumbing, plus a real uvicorn
-  server on an ephemeral port serving HTTPS with an openssl-minted certificate.
-  These skip cleanly where `openssl` is unavailable.
+- **API TLS / mTLS** (`test_api_tls.py`) — the ssl config plumbing, plus real
+  uvicorn servers on ephemeral ports. Mints a full PKI with `openssl` (CA, server
+  cert, client cert, and a *rogue* CA with its own client cert) and asserts that a
+  trusted client certificate is accepted while a missing or rogue-CA one is
+  refused during the handshake. Skips cleanly where `openssl` is unavailable.
 - **packaging** (`test_windows_deployment.py`) — the service module compiles, and
   every platform-specific pin carries the marker that keeps `requirements.txt`
   installable on Windows.
+
+Note that the test CA carries `keyUsage=critical,keyCertSign,cRLSign`. Python 3.13
+turned on `VERIFY_X509_STRICT` in `ssl.create_default_context()`, so a CA that signs
+other certificates without that extension is rejected — `openssl req -x509` does not
+add it by default.
+
+This is a **client-side** constraint. It affects a client verifying the server's
+chain (here, the test client), not uvicorn, which builds a bare
+`ssl.SSLContext(PROTOCOL_TLS_SERVER)` without strict mode. Server-side verification
+of client certificates therefore tolerates a CA that lacks the extension; the test
+client verifying the server would not. Confirmed empirically: an earlier run with a
+non-compliant CA still enforced mTLS correctly, refusing both a missing and a
+rogue-CA client certificate.
 
 Two of these are *anti-mock* guards rather than behaviour tests.
 `test_relay_calls_match_the_real_smtplib_signatures` binds every argument the relay

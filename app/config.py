@@ -103,6 +103,33 @@ class ApiConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _mtls_options_are_coherent(self) -> "ApiConfig":
+        """Reject mTLS settings that would silently no-op, or silently lock everyone out.
+
+        uvicorn loads the client CA bundle only when ``ssl_ca_certs`` is given, but
+        sets ``verify_mode`` from ``ssl_cert_reqs`` unconditionally. The two must
+        therefore be configured together:
+
+        * ``ssl_ca_certs`` alone leaves ``verify_mode`` at ``CERT_NONE``, so no
+          client certificate is ever requested and mTLS does nothing at all.
+        * ``ssl_cert_reqs`` alone verifies clients against an empty trust store,
+          so every client -- including valid ones -- is rejected.
+        """
+        if self.ssl_ca_certs is not None and self.ssl_cert_reqs is None:
+            raise ValueError(
+                'api.ssl_ca_certs is set but api.ssl_cert_reqs is not; uvicorn would '
+                'leave verify_mode at CERT_NONE and never request a client certificate. '
+                'Set ssl_cert_reqs = "optional" or "required".'
+            )
+        if self.ssl_cert_reqs in ("optional", "required") and self.ssl_ca_certs is None:
+            raise ValueError(
+                f'api.ssl_cert_reqs = "{self.ssl_cert_reqs}" requires api.ssl_ca_certs; '
+                "without a client CA bundle no certificate can validate, so every "
+                "client would be rejected."
+            )
+        return self
+
     @property
     def tls_enabled(self) -> bool:
         return self.ssl_certfile is not None
