@@ -223,26 +223,45 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Ok "Service account: $ServiceAccount"
 
-# Grant by SID, not by name. "NT SERVICE\<name>" contains a space, and embedding
-# literal quotes in a native-command argument does not work: PowerShell already
-# quotes arguments containing spaces and escapes embedded quotes, so icacls
-# receives the quotes as part of the identity and LookupAccountName fails with
-# 1332 ERROR_NONE_MAPPED. "*S-1-5-80-..." has no spaces and no ambiguity.
+# Read it back so a silently-ignored account change is visible rather than
+# discovered later as a permissions failure.
+$qc = (& sc.exe qc $ServiceName) -join "`n"
+if ($qc -match '(?m)^\s*SERVICE_START_NAME\s*:\s*(.+)$') {
+    Write-Ok "Confirmed start name: $($Matches[1].Trim())"
+} else {
+    Write-Warn2 "Could not read SERVICE_START_NAME from 'sc.exe qc' (localized output?)."
+}
+
+# Resolve the account to a SID with `sc.exe showsid`, NOT by name lookup.
+# "NT SERVICE\<name>" is not resolvable through LookupAccountName, so both
+# NTAccount.Translate and icacls-by-name fail with 1332 ERROR_NONE_MAPPED even
+# when sc.exe accepted the account and the service exists - confirmed on a real
+# Windows 11 ARM64 host. showsid computes the virtual-account SID directly.
+# Match on the SID token only, so localized sc.exe output does not matter.
 $serviceSid = $null
-try {
-    $ntAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
-    $serviceSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-} catch {
-    $serviceSid = $null
+$showsid = (& sc.exe showsid $ServiceName) -join "`n"
+if ($showsid -match 'S-1-5-80-[0-9-]+') {
+    $serviceSid = $Matches[0]
+}
+
+if (-not $serviceSid) {
+    try {
+        $ntAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
+        $serviceSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        $serviceSid = $null
+    }
 }
 
 if ($serviceSid) {
+    # "*SID" form: no spaces, so no quoting ambiguity for a native command.
     $identity = "*$serviceSid"
     Write-Ok "$ServiceAccount -> $serviceSid"
 } else {
-    # Fall back to the name and let PowerShell do the quoting - do NOT add quotes.
     $identity = $ServiceAccount
-    Write-Warn2 "Could not resolve a SID for '$ServiceAccount'; using the account name."
+    Write-Warn2 "Could not resolve a SID for '$ServiceAccount'; falling back to the name."
+    Write-Warn2 "icacls will probably fail with 1332. Get the SID with:"
+    Write-Warn2 "  sc.exe showsid $ServiceName"
 }
 
 # The variable must be braced as ${identity}. Unbraced and followed by a colon it

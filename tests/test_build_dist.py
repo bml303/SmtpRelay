@@ -314,6 +314,34 @@ def test_installer_grants_acls_by_sid_not_by_quoted_name():
     assert '"$identity:' not in script
 
 
+def test_installer_resolves_service_sid_with_sc_showsid():
+    """LookupAccountName cannot resolve "NT SERVICE\\<name>".
+
+    Confirmed on a real Windows 11 ARM64 host: both NTAccount.Translate and
+    icacls-by-name fail with 1332 ERROR_NONE_MAPPED even though the service
+    exists and `sc.exe config obj=` accepted the account. `sc.exe showsid`
+    computes the virtual-account SID directly, so it must be the primary path
+    and name lookup only a fallback.
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "sc.exe showsid" in script, "SID must come from sc.exe showsid"
+    assert "S-1-5-80-" in script, "the virtual-service SID prefix is not matched"
+    assert script.index("sc.exe showsid") < script.index("NTAccount"), (
+        "NTAccount.Translate must be the fallback, not the primary path"
+    )
+    # The SID must be granted in *SID form so no quoting ambiguity remains.
+    assert '$identity = "*$serviceSid"' in script
+
+
+def test_installer_confirms_the_service_account_took_effect():
+    """A silently-ignored `sc.exe config obj=` surfaces later as a permissions failure."""
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "sc.exe qc" in script
+    assert "SERVICE_START_NAME" in script
+
+
 def test_acl_failure_is_fatal_not_a_warning():
     """Without these grants the service cannot read its runtime or config."""
     script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
