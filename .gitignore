@@ -8,3 +8,6 @@ dist/
 
 # Local config may hold a mailhost password or API token.
 config.toml
+
+# Qwen Code session state: auto-generated tool permissions, not project config.
+.qwen/
