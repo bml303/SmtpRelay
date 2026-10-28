@@ -334,6 +334,25 @@ def test_installer_resolves_service_sid_with_sc_showsid():
     assert '$identity = "*$serviceSid"' in script
 
 
+def test_installer_sets_service_sid_type_unrestricted():
+    """Without this, every ACL grant to the virtual SID is inert.
+
+    Observed on real Windows 11 ARM64: `sc.exe config obj= "NT SERVICE\\X"`
+    succeeded and `sc.exe qc` confirmed SERVICE_START_NAME, but
+    `sc.exe qsidtype` reported SERVICE_SID_TYPE: NONE. The service process then
+    never carries the virtual SID in its token, and the SID is not instantiated in
+    the local account database - which is also why LookupAccountName and
+    LookupAccountSid both failed with 1332 even for the correct "*S-1-5-80-..."
+    form. Three rounds of ACL fixes were aimed at the wrong layer.
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "sc.exe sidtype $ServiceName unrestricted" in script
+    # Must happen before any grant, and be read back rather than assumed.
+    assert script.index("sc.exe sidtype") < script.index("icacls.exe")
+    assert "qsidtype" in script, "SERVICE_SID_TYPE is never verified after being set"
+
+
 def test_installer_confirms_the_service_account_took_effect():
     """A silently-ignored `sc.exe config obj=` surfaces later as a permissions failure."""
     script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()

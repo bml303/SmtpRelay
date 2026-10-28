@@ -223,13 +223,39 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Ok "Service account: $ServiceAccount"
 
-# Read it back so a silently-ignored account change is visible rather than
-# discovered later as a permissions failure.
+# CRITICAL, and easy to miss: setting obj= alone leaves SERVICE_SID_TYPE at NONE,
+# which means the service process never receives the virtual SID in its token.
+# Every ACL grant to that SID is then inert, and the SID is not instantiated in
+# the local account database - so LookupAccountName/LookupAccountSid cannot
+# resolve it either, which is how icacls comes back with 1332 ERROR_NONE_MAPPED
+# even for the correct "*S-1-5-80-..." form. Observed on a real Windows 11 ARM64
+# host: `sc.exe qsidtype` reported NONE after a successful obj= change.
+& sc.exe sidtype $ServiceName unrestricted | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Stop-WithError "sc.exe could not set SERVICE_SID_TYPE to unrestricted (exit $LASTEXITCODE)." `
+        "Without it the virtual account SID is never in the service token."
+}
+Write-Ok "SERVICE_SID_TYPE: unrestricted"
+
+# Read both back, so a silently-ignored change is visible here rather than
+# surfacing later as an unrelated permissions or start failure.
 $qc = (& sc.exe qc $ServiceName) -join "`n"
 if ($qc -match '(?m)^\s*SERVICE_START_NAME\s*:\s*(.+)$') {
     Write-Ok "Confirmed start name: $($Matches[1].Trim())"
 } else {
     Write-Warn2 "Could not read SERVICE_START_NAME from 'sc.exe qc' (localized output?)."
+}
+
+$qsid = (& sc.exe qsidtype $ServiceName) -join "`n"
+if ($qsid -match '(?m)^\s*SERVICE_SID_TYPE\s*:\s*(.+)$') {
+    $sidType = $Matches[1].Trim()
+    if ($sidType -eq 'NONE') {
+        Stop-WithError "SERVICE_SID_TYPE is still NONE after 'sc.exe sidtype'." `
+            "The service would run without its virtual SID, so no ACL could apply."
+    }
+    Write-Ok "Confirmed SID type: $sidType"
+} else {
+    Write-Warn2 "Could not read SERVICE_SID_TYPE from 'sc.exe qsidtype' (localized output?)."
 }
 
 # Resolve the account to a SID with `sc.exe showsid`, NOT by name lookup.
