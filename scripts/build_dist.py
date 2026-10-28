@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -201,6 +202,79 @@ def download_wheels(wheel_dir: Path, requirements: Path, platform: str, python_v
     return len(wheels)
 
 
+def verify_dependency_closure(
+    wheel_dir: Path, *, platform: str, runtime_version: str
+) -> dict[str, list[str]]:
+    """Return ``{missing package: [reason]}`` for the target platform.
+
+    This cannot be delegated to pip. pip evaluates PEP 508 markers against the
+    *host* interpreter, so neither ``pip freeze`` on Linux nor
+    ``pip download --platform win_arm64`` will ever surface a Windows-only
+    transitive dependency. ``pytest``'s ``colorama>=0.4; sys_platform == "win32"``
+    is exactly that, and it broke the first real offline install on the target
+    with "No matching distribution found". So the closure is computed here from
+    each wheel's own METADATA, with markers evaluated for the target.
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    machine = "ARM64" if platform == "win_arm64" else "AMD64"
+    env_base = {
+        "sys_platform": "win32",
+        "os_name": "nt",
+        "platform_system": "Windows",
+        "platform_machine": machine,
+        "python_version": wheel_tag_for(runtime_version),
+        "python_full_version": runtime_version,
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+    }
+
+    def norm(name: str) -> str:
+        return canonicalize_name(name).replace("_", "-")
+
+    requires: dict[str, list[str]] = {}
+    for wheel in sorted(wheel_dir.glob("*.whl")):
+        with zipfile.ZipFile(wheel) as zf:
+            metas = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+            if not metas:
+                continue
+            text = zf.read(metas[0]).decode("utf-8", "replace")
+        requires[norm(wheel.name.split("-")[0])] = re.findall(
+            r"^Requires-Dist:\s*(.+)$", text, re.M
+        )
+
+    #: Extras the project actually requests. ``pydantic[email]`` is the only one,
+    #: and without this its ``email-validator`` requirement would be skipped.
+    requested_extras: dict[str, set[str]] = {"pydantic": {"email"}}
+
+    missing: dict[str, list[str]] = {}
+    for package, lines in sorted(requires.items()):
+        active = requested_extras.get(package, set())
+        for line in lines:
+            try:
+                req = Requirement(line)
+            except Exception:
+                continue
+            if req.marker is not None:
+                matched = False
+                for extra in active | {""}:
+                    env = dict(env_base)
+                    env["extra"] = extra
+                    try:
+                        if req.marker.evaluate(env):
+                            matched = True
+                            break
+                    except Exception:
+                        pass
+                if not matched:
+                    continue
+            name = norm(req.name)
+            if name not in requires:
+                missing.setdefault(name, []).append(f"{package} requires {line}")
+    return missing
+
+
 def stage_source(payload: Path) -> None:
     for name in SOURCE_FILES:
         src = PROJECT_ROOT / name
@@ -323,6 +397,23 @@ def main() -> int:
         wheel_count = download_wheels(
             payload / "wheels", requirements, args.platform, python_version
         )
+
+    missing = verify_dependency_closure(
+        payload / "wheels", platform=args.platform, runtime_version=args.runtime_version
+    )
+    if missing:
+        detail = "\n".join(
+            f"    {name}\n      <- {'; '.join(reasons)}"
+            for name, reasons in sorted(missing.items())
+        )
+        raise SystemExit(
+            "Dependency closure is incomplete for the target platform:\n"
+            f"{detail}\n"
+            "Add each missing package to requirements.txt with a "
+            "`; sys_platform == 'win32'` marker, then rebuild. An offline install "
+            "on the target cannot fetch what is not bundled."
+        )
+    print("  dependency closure verified for the target platform")
 
     stage_source(payload)
     write_manifest(

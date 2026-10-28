@@ -128,14 +128,23 @@ def test_pyproject_declares_plain_uvicorn():
         assert "[standard]" not in requirement, requirement
 
 
-def test_pywin32_is_the_only_platform_specific_pin():
-    """With plain uvicorn the set is cross-platform; only pywin32 needs a marker."""
+#: Pins that exist only on Windows. `pip freeze` on Linux can never emit either,
+#: so both must be maintained by hand and are guarded here.
+WINDOWS_ONLY_PINS = {"pywin32", "colorama"}
+
+
+def test_platform_specific_pins_are_exactly_the_windows_only_set():
+    """pywin32 is the native service dep; colorama is pytest's Windows-only
+    transitive dep, which pip's host-based marker evaluation hides on Linux.
+    """
     entries = _pinned_entries()
 
-    assert "sys_platform == 'win32'" in entries["pywin32"]
+    for name in WINDOWS_ONLY_PINS:
+        assert name in entries, f"{name} is missing from requirements.txt"
+        assert "sys_platform == 'win32'" in entries[name], f"{name}: {entries[name]}"
 
     marked = {name for name, marker in entries.items() if marker}
-    assert marked == {"pywin32"}, f"unexpected platform-marked pins: {sorted(marked)}"
+    assert marked == WINDOWS_ONLY_PINS, f"unexpected platform-marked pins: {sorted(marked)}"
 
 
 def test_only_well_wheeled_packages_remain_compiled():

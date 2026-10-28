@@ -297,3 +297,86 @@ def test_uninstaller_uses_the_bundled_runtime():
 
     assert "python\\python.exe" in script
     assert ".venv" not in script
+
+
+# --- dependency closure ----------------------------------------------------
+
+
+def make_wheel(directory, name: str, version: str, requires=()) -> "Path":
+    """A minimal wheel whose METADATA carries the given Requires-Dist lines."""
+    from pathlib import Path as _P
+
+    wheel = _P(directory) / f"{name}-{version}-py3-none-any.whl"
+    dist_info = f"{name}-{version}.dist-info"
+    metadata = ["Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}"]
+    metadata += [f"Requires-Dist: {r}" for r in requires]
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr(f"{dist_info}/METADATA", "\n".join(metadata) + "\n")
+        zf.writestr(f"{dist_info}/WHEEL", "Wheel-Version: 1.0\n")
+    return wheel
+
+
+def closure(wheel_dir, platform="win_arm64"):
+    return build_dist.verify_dependency_closure(
+        wheel_dir, platform=platform, runtime_version="3.15.2"
+    )
+
+
+def test_closure_reports_a_windows_only_dependency_that_is_missing(tmp_path):
+    """The exact failure that broke the first real offline install."""
+    make_wheel(tmp_path, "pytest", "9.2.0", requires=['colorama>=0.4; sys_platform == "win32"'])
+
+    missing = closure(tmp_path)
+
+    assert "colorama" in missing
+    assert any("pytest requires" in reason for reason in missing["colorama"])
+
+
+def test_closure_is_satisfied_when_the_dependency_is_bundled(tmp_path):
+    make_wheel(tmp_path, "pytest", "9.2.0", requires=['colorama>=0.4; sys_platform == "win32"'])
+    make_wheel(tmp_path, "colorama", "0.4.6")
+
+    assert closure(tmp_path) == {}
+
+
+def test_closure_ignores_unix_only_dependencies(tmp_path):
+    """The inverse case must not produce a false positive."""
+    make_wheel(tmp_path, "uvicorn", "0.54.0", requires=['uvloop>=0.15; sys_platform != "win32"'])
+
+    assert closure(tmp_path) == {}
+
+
+def test_closure_honours_requested_extras(tmp_path):
+    """pydantic[email] is used, so email-validator counts as required."""
+    make_wheel(
+        tmp_path, "pydantic", "2.14.1",
+        requires=['email-validator>=2.0.0; extra == "email"'],
+    )
+
+    assert "email-validator" in closure(tmp_path)
+
+
+def test_closure_ignores_extras_that_are_not_requested(tmp_path):
+    make_wheel(
+        tmp_path, "uvicorn", "0.54.0",
+        requires=['watchfiles>=0.20; extra == "standard"'],
+    )
+
+    assert closure(tmp_path) == {}
+
+
+def test_closure_normalizes_underscores_and_case(tmp_path):
+    """pydantic_core and Pydantic-Core are the same distribution."""
+    make_wheel(tmp_path, "pydantic", "2.14.1", requires=["Pydantic-Core>=2.14.1"])
+    make_wheel(tmp_path, "pydantic_core", "2.50.1")
+
+    assert closure(tmp_path) == {}
+
+
+def test_requirements_pin_the_windows_only_transitive_dep():
+    """`pip freeze` on Linux can never emit this line, so guard it explicitly."""
+    text = (build_dist.PROJECT_ROOT / "requirements.txt").read_text()
+    lines = [ln for ln in text.splitlines() if ln.strip().lower().startswith("colorama")]
+
+    assert lines, "colorama is missing from requirements.txt"
+    assert "sys_platform == 'win32'" in lines[0]

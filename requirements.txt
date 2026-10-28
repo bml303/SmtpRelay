@@ -58,3 +58,10 @@ uvicorn==0.54.0
 # --- platform-specific -------------------------------------------------
 # pywin32 is required only for the native Windows service (app/windows_service.py).
 pywin32==312; sys_platform == 'win32'
+
+# pytest requires colorama only on Windows. `pip freeze` on Linux omits it, and
+# pip evaluates markers against the HOST, so `pip download --platform win_arm64`
+# omits it too - the payload then fails to install offline with
+# "No matching distribution found for colorama>=0.4". build_dist.py verifies the
+# closure and refuses to build if this line is dropped.
+colorama==0.4.6; sys_platform == 'win32'
