@@ -1,13 +1,17 @@
 """The dist builder runs on any host, so its logic is testable here.
 
-The two things worth guarding are the ones that would ship a broken or leaky
-payload: PEP 508 marker selection (which platform pins survive for Windows) and
-the staging allowlist (which must never include the developer's config.toml).
+Guards the things that would otherwise ship a broken or leaky payload: PEP 508
+marker selection (which platform pins survive for Windows), the staging allowlist
+(which must never include the developer's config.toml), archive naming (which must
+not collide across targets), the runtime/wheel-tag coupling, and the fact that the
+installer uses the bundled runtime rather than discovering a system interpreter.
 """
 
 from __future__ import annotations
 
 import zipfile
+
+import pytest
 
 import build_dist
 
@@ -210,3 +214,86 @@ def test_installer_scripts_are_present():
     scripts = sorted(p.name for p in build_dist.INSTALLER_DIR.glob("*.ps1"))
 
     assert scripts == ["install.ps1", "uninstall.ps1"]
+
+
+# --- bundled CPython runtime ----------------------------------------------
+
+
+def test_runtime_package_mapping_covers_both_supported_platforms():
+    assert build_dist.NUGET_RUNTIME_PACKAGES == {
+        "win_amd64": "python",
+        "win_arm64": "pythonarm64",
+    }
+
+
+def test_unsupported_platform_is_rejected_with_a_clear_message():
+    """There is no 32-bit nuget CPython package, so fail at build time."""
+    with pytest.raises(SystemExit) as excinfo:
+        build_dist.runtime_package_for("win32")
+
+    assert "win32" in str(excinfo.value)
+    assert "win_arm64" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("runtime_version", "expected"),
+    [("3.15.2", "3.15"), ("3.15", "3.15"), ("3.13.1", "3.13"), ("3.11.0", "3.11")],
+)
+def test_wheel_tag_is_derived_from_the_runtime_version(runtime_version, expected):
+    """Deriving the tag is the point: wheels must match the bundled interpreter."""
+    assert build_dist.wheel_tag_for(runtime_version) == expected
+
+
+@pytest.mark.parametrize("bad", ["3", "latest", "", "3.x.1", None])
+def test_malformed_runtime_version_is_rejected(bad):
+    with pytest.raises(SystemExit):
+        build_dist.wheel_tag_for(bad)
+
+
+def test_default_runtime_version_yields_a_consistent_tag():
+    tag = build_dist.wheel_tag_for(build_dist.DEFAULT_RUNTIME_VERSION)
+
+    assert tag == ".".join(build_dist.DEFAULT_RUNTIME_VERSION.split(".")[:2])
+
+
+def test_pip_is_bundled_so_bootstrap_has_an_offline_fallback():
+    """ensurepip is primary, but the wheel must be present if it misbehaves."""
+    joined = " ".join(build_dist.BUILD_BACKEND_PACKAGES).lower()
+
+    assert "pip" in joined
+    assert "setuptools" in joined
+
+
+# --- installer must use the bundled runtime, not discover one --------------
+
+
+def test_installer_does_not_discover_a_system_interpreter():
+    """Regression guard: the payload is self-contained by design.
+
+    Interpreter discovery is what makes the install depend on the Python Install
+    Manager's per-user %LOCALAPPDATA% runtime, which a service account cannot
+    rely on.
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    for forbidden in ("py.exe", "Get-Command python", "-m venv", "$PythonExecutable", "$PythonVersion"):
+        assert forbidden not in script, f"install.ps1 still contains {forbidden!r}"
+
+
+def test_installer_uses_the_bundled_runtime():
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "$RuntimeSrc" in script
+    assert "'python'" in script, "the runtime directory is not copied into InstallDir"
+    # install.ps1 composes the path with Join-Path rather than a literal.
+    assert "Join-Path $RuntimeDir 'python.exe'" in script
+    assert "-m ensurepip" in script
+    # Every install step must go through the bundled interpreter.
+    assert script.count("& $Python -m pip install") >= 3
+
+
+def test_uninstaller_uses_the_bundled_runtime():
+    script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+
+    assert "python\\python.exe" in script
+    assert ".venv" not in script

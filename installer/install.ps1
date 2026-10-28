@@ -39,8 +39,6 @@ param(
     # with every other service on the box, so the ACL grants below are readable
     # by this service alone.
     [string] $ServiceAccount = "NT SERVICE\$ServiceName",
-    [string] $PythonVersion = '3.15',
-    [string] $PythonExecutable,
     [int]    $ApiPort = 8000,
     [switch] $OpenFirewall,
     [switch] $Start,
@@ -52,9 +50,11 @@ Set-StrictMode -Version Latest
 
 $PayloadDir = $PSScriptRoot
 $WheelDir   = Join-Path $PayloadDir 'wheels'
-$VenvDir    = Join-Path $InstallDir '.venv'
-$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
-$VenvPip    = Join-Path $VenvDir 'Scripts\pip.exe'
+$RuntimeSrc = Join-Path $PayloadDir 'python'
+$RuntimeDir = Join-Path $InstallDir 'python'
+# The bundled runtime IS the environment: no venv, so no pyvenv.cfg whose
+# `home=` would point back into some user's Python installation.
+$Python     = Join-Path $RuntimeDir 'python.exe'
 
 function Write-Step { param([string] $Message) Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "    $Message" -ForegroundColor Green }
@@ -79,7 +79,7 @@ function Invoke-Checked {
 
 Write-Step "Validating payload in $PayloadDir"
 
-foreach ($required in @($WheelDir, (Join-Path $PayloadDir 'app'), (Join-Path $PayloadDir 'pyproject.toml'))) {
+foreach ($required in @($WheelDir, (Join-Path $RuntimeSrc 'python.exe'), (Join-Path $PayloadDir 'app'), (Join-Path $PayloadDir 'pyproject.toml'))) {
     if (-not (Test-Path $required)) {
         Stop-WithError "Payload is incomplete: '$required' is missing." `
             "Run install.ps1 from inside the extracted payload directory."
@@ -91,10 +91,7 @@ $ManifestPath = Join-Path $PayloadDir 'MANIFEST.json'
 if (Test-Path $ManifestPath) {
     $manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
     $Version = $manifest.version
-    Write-Ok "SmtpRelay $Version for $($manifest.platform) / cp$($manifest.python_version -replace '\.','')"
-    if ($manifest.python_version -and $manifest.python_version -ne $PythonVersion) {
-        Write-Warn2 "Payload was built for Python $($manifest.python_version) but -PythonVersion is $PythonVersion."
-    }
+    Write-Ok "SmtpRelay $Version for $($manifest.platform), bundled CPython $($manifest.runtime_version)"
 } else {
     Write-Warn2 "No MANIFEST.json; continuing without version metadata."
 }
@@ -109,75 +106,55 @@ if ((Test-Path $InstallDir) -and -not $Force) {
     Stop-WithError "'$InstallDir' already exists." "Re-run with -Force to replace it."
 }
 
-# ------------------------------------------------------------------- python
-
-Write-Step "Locating a Python interpreter (>= 3.11)"
-
-$probe = 'import sys; print("%d.%d" % sys.version_info[:2])'
-$resolved = $null
-
-if ($PythonExecutable) {
-    $candidates = @(, @($PythonExecutable, @()))
-} else {
-    $candidates = @()
-    if (Get-Command py.exe -ErrorAction SilentlyContinue) {
-        $candidates += , @('py.exe', @("-$PythonVersion"))
-        $candidates += , @('py.exe', @('-3'))
-    }
-    $candidates += , @('python.exe', @())
-}
-
-foreach ($candidate in $candidates) {
-    $exe = $candidate[0]
-    $pre = $candidate[1]
-    try {
-        $out = & $exe @pre -c $probe 2>$null
-    } catch { $out = $null }
-    if ($LASTEXITCODE -eq 0 -and $out) {
-        $resolved = [pscustomobject]@{ Exe = $exe; PreArgs = $pre; Version = $out.Trim() }
-        break
-    }
-}
-
-if (-not $resolved) {
-    Stop-WithError "No usable Python interpreter found." `
-        "Install Python 3.11+ from python.org, or pass -PythonExecutable 'C:\path\to\python.exe'."
-}
-
-$major, $minor = $resolved.Version.Split('.') | ForEach-Object { [int] $_ }
-if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 11)) {
-    Stop-WithError "Python $($resolved.Version) is too old; 3.11 or newer is required."
-}
-Write-Ok "Using $($resolved.Exe) $($resolved.PreArgs -join ' ') (Python $($resolved.Version))"
-
 # ------------------------------------------------------------------ install
 
 Write-Step "Preparing $InstallDir"
 if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force }
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
-foreach ($item in @('app', 'pyproject.toml', 'README.md', 'config.example.toml', 'requirements.txt')) {
+# The bundled CPython runtime is copied in alongside the application. No
+# interpreter discovery and no venv: the runtime directory IS the environment, so
+# nothing depends on a Python that happens to be installed for some user.
+foreach ($item in @('python', 'app', 'pyproject.toml', 'README.md', 'config.example.toml', 'requirements.txt')) {
     $src = Join-Path $PayloadDir $item
-    if (Test-Path $src) { Copy-Item $src -Destination $InstallDir -Recurse -Force }
+    if (-not (Test-Path $src)) { Stop-WithError "Payload is missing '$item'." }
+    Copy-Item $src -Destination $InstallDir -Recurse -Force
 }
-Write-Ok "Application files copied"
+if (-not (Test-Path $Python)) { Stop-WithError "Copied runtime has no '$Python'." }
 
-Write-Step "Creating virtual environment"
-Invoke-Checked "venv creation" { & $resolved.Exe @($resolved.PreArgs) -m venv $VenvDir }
-if (-not (Test-Path $VenvPython)) { Stop-WithError "venv was created but '$VenvPython' is missing." }
-Write-Ok "venv at $VenvDir"
+$runtimeVersion = (& $Python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" | Select-Object -Last 1)
+if ($LASTEXITCODE -ne 0 -or -not $runtimeVersion) {
+    Stop-WithError "The bundled interpreter at '$Python' will not run." `
+        "This usually means the payload architecture does not match the machine."
+}
+Write-Ok "Bundled CPython $runtimeVersion at $RuntimeDir"
 
-# setuptools/wheel come from the bundle: Python 3.12+ venvs no longer include
-# setuptools, and pip's build isolation would otherwise contact PyPI.
+Write-Step "Bootstrapping pip (offline)"
+# ensurepip installs from the pip wheel bundled inside the runtime, so no network.
+& $Python -m ensurepip 2>&1 | Out-Null
+& $Python -c "import pip" 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    # Fallback: run pip straight out of the bundled wheel via zipimport.
+    Write-Warn2 "ensurepip left pip unimportable; bootstrapping from the bundled wheel."
+    $pipWheel = Get-ChildItem $WheelDir -Filter 'pip-*.whl' | Select-Object -First 1
+    if (-not $pipWheel) { Stop-WithError "No pip wheel in '$WheelDir' to bootstrap from." }
+    Invoke-Checked "pip bootstrap" {
+        & $Python (Join-Path $pipWheel.FullName 'pip') install --no-index --find-links $WheelDir --quiet pip
+    }
+}
+Write-Ok ((& $Python -m pip --version | Select-Object -Last 1))
+
 Write-Step "Installing build backend (offline)"
+# setuptools is needed to build the project's own wheel; pip's build isolation
+# would otherwise contact PyPI.
 Invoke-Checked "build backend install" {
-    & $VenvPip install --no-index --find-links $WheelDir --quiet setuptools wheel
+    & $Python -m pip install --no-index --find-links $WheelDir --quiet setuptools wheel
 }
 Write-Ok "setuptools + wheel"
 
 Write-Step "Installing dependencies from bundled wheels (offline)"
 Invoke-Checked "dependency install" {
-    & $VenvPip install --no-index --find-links $WheelDir --quiet -r (Join-Path $InstallDir 'requirements.txt')
+    & $Python -m pip install --no-index --find-links $WheelDir --quiet -r (Join-Path $InstallDir 'requirements.txt')
 }
 Write-Ok "dependencies installed"
 
@@ -185,7 +162,7 @@ Write-Step "Installing smtp-relay"
 # --no-deps: requirements.txt already pinned and installed everything.
 # --no-build-isolation: use the setuptools just installed, no PyPI access.
 Invoke-Checked "project install" {
-    & $VenvPip install --no-index --find-links $WheelDir --no-deps --no-build-isolation --quiet $InstallDir
+    & $Python -m pip install --no-index --find-links $WheelDir --no-deps --no-build-isolation --quiet $InstallDir
 }
 Write-Ok "smtp-relay $Version installed"
 
@@ -214,7 +191,7 @@ Write-Ok "ACLs applied after service registration"
 Write-Step "Registering service '$ServiceName'"
 Push-Location $InstallDir
 try {
-    & $VenvPython -m app.windows_service install
+    & $Python -m app.windows_service install
     $installExit = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -222,7 +199,7 @@ try {
 
 if ($installExit -ne 0) {
     Stop-WithError "Service registration failed (exit $installExit)." `
-        "Try: & '$VenvPython' '$(Join-Path $VenvDir 'Scripts\pywin32_postinstall.py')' -install"
+        "Try: & '$Python' '$(Join-Path $RuntimeDir 'Scripts\pywin32_postinstall.py')' -install"
 }
 Write-Ok "Service registered"
 
@@ -308,7 +285,7 @@ Write-Ok "Listed in Apps & features"
 
 if ($Start) {
     Write-Step "Starting service"
-    & $VenvPython -m app.windows_service start
+    & $Python -m app.windows_service start
     Start-Sleep -Seconds 2
     $state = (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue).Status
     if ($state -eq 'Running') {
@@ -326,14 +303,17 @@ Installation complete.
   Configuration : $configFile
   Service name  : $ServiceName
   Runs as       : $ServiceAccount
-  Python        : $VenvPython
+  Runtime       : $Python (bundled CPython $runtimeVersion)
 
 Next steps:
   1. Edit the configuration:   notepad "$configFile"
-  2. Verify config discovery:  & '$VenvPython' -c "from app.config import _candidate_paths; [print(p) for p in _candidate_paths(None)[0]]"
-  3. Console test run:         & '$VenvPython' -m app.windows_service debug
-  4. Start the service:        & '$VenvPython' -m app.windows_service start
+  2. Verify config discovery:  & '$Python' -c "from app.config import _candidate_paths; [print(p) for p in _candidate_paths(None)[0]]"
+  3. Console test run:         & '$Python' -m app.windows_service debug
+  4. Start the service:        & '$Python' -m app.windows_service start
   5. Read the logs:            Get-EventLog -LogName Application -Source SmtpRelay -Newest 20
+
+No system Python is used or required: the runtime lives in $RuntimeDir and is
+private to this service.
 
 Exposing the API beyond this machine:
   - set api.host in config.toml to the interface you want (e.g. 0.0.0.0)

@@ -25,7 +25,7 @@ param(
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Version Latest
 
-$VenvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
+$Python = Join-Path $InstallDir 'python\python.exe'
 
 function Write-Step { param([string] $Message) Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "    $Message" -ForegroundColor Green }
@@ -48,10 +48,10 @@ if ($service) {
     }
 
     $removed = $false
-    if (Test-Path $VenvPython) {
+    if (Test-Path $Python) {
         Push-Location $InstallDir
         try {
-            & $VenvPython -m app.windows_service remove 2>&1 | Out-Null
+            & $Python -m app.windows_service remove 2>&1 | Out-Null
             $removed = ($LASTEXITCODE -eq 0)
         } finally {
             Pop-Location

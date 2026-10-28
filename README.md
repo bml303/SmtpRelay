@@ -275,7 +275,7 @@ encoding applied by every mail client, and is unrelated to the API-level rule ab
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest          # 172 tests
+.venv/bin/python -m pytest          # 188 tests
 ```
 
 Six layers:
@@ -324,12 +324,28 @@ looks like; see History below.
 ## Deploying as a Windows service
 
 The relay runs as a **native Windows service** through pywin32 — no external
-wrapper binary. Install the dependencies, which pull in pywin32 automatically on
-Windows:
+wrapper binary.
+
+For production, use the [offline payload](#building-an-offline-payload), which
+bundles its own CPython. The manual route below is for development and testing; it
+creates a venv from whatever interpreter you point it at, and a venv's
+`pyvenv.cfg` records `home=` pointing back into that interpreter. If that is the
+Python Install Manager's per-user runtime under `%LOCALAPPDATA%`, the service ends
+up depending on one user's profile.
 
 ```powershell
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\pip install --no-deps -e .
+```
+
+Note that under the Python Install Manager, `python.exe` may not resolve at all —
+it is an app-execution alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is
+per-user and often invisible in an elevated console. `py -3.15` does resolve, so
+create the venv with that:
+
+```powershell
+py -3.15 -m venv .venv
+py -3.15 -c "import sysconfig; print(sysconfig.get_platform())"   # win-amd64 or win-arm64
 ```
 
 Before touching the service at all, the real smoke test is a plain foreground run,
@@ -364,62 +380,87 @@ The service registers as `SmtpRelay`, displayed as "SMTP Relay".
 
 ### Building an offline payload
 
-Instead of cloning and installing on the target, build a self-contained payload
-that installs with **no internet access and no C/C++ compiler**:
+Instead of cloning and installing on the target, build a fully self-contained
+payload that installs with **no internet access, no C/C++ compiler, and no
+pre-existing Python**:
 
 ```bash
-.venv/bin/python scripts/build_dist.py                       # win_amd64, cp3.15
-.venv/bin/python scripts/build_dist.py --python-version 3.13
-.venv/bin/python scripts/build_dist.py --platform win_arm64 --zip
+.venv/bin/python scripts/build_dist.py                        # win_arm64, CPython 3.15.2
+.venv/bin/python scripts/build_dist.py --platform win_amd64
+.venv/bin/python scripts/build_dist.py --runtime-version 3.15.1 --zip
 ```
 
-This runs from any host OS, including Linux: wheels are fetched for the *target*
-platform via pip's cross-platform resolver. Because `--only-binary=:all:` is used,
-a package with no matching wheel fails the build **here** rather than demanding
-MSVC on the target. Markers are evaluated for a synthetic win32 environment first,
-since pip otherwise evaluates them against the build host and mis-resolves.
+This runs from any host OS, including Linux: both the wheels and the CPython
+runtime are fetched for the *target* platform. Because `--only-binary=:all:` is
+used, a package with no matching wheel fails the build **here** rather than
+demanding MSVC on the target. Markers are evaluated for a synthetic win32
+environment first, since pip otherwise evaluates them against the build host and
+mis-resolves.
+
+The wheel tag is **derived** from `--runtime-version` rather than specified
+separately, so the wheels cannot disagree with the bundled interpreter.
 
 The result is `dist/SmtpRelay-<version>-<platform>-<tag>/`:
 
 ```
+python/                full CPython runtime for the target architecture
 app/                   application source
 wheels/                every dependency as a target-platform wheel
 install.ps1            offline installer (elevated)
 uninstall.ps1
 config.example.toml    template - the developer's config.toml is never staged
 pyproject.toml, requirements.txt, README.md
-MANIFEST.json          version, target, per-file sha256, payload digest
+MANIFEST.json          version, runtime_version, target, per-file sha256, payload digest
 ```
 
-`dist/` is a build artifact and is gitignored. The staging list is an allowlist,
-so `config.toml` (which may hold a real SMTP password) cannot leak into a payload;
+`dist/` is a build artifact and is gitignored. Staging is an allowlist, so
+`config.toml` (which may hold a real SMTP password) cannot leak into a payload;
 `tests/test_build_dist.py` asserts that.
 
 Copy the directory to the target and, from an **elevated** prompt:
 
 ```powershell
-cd C:\Temp\SmtpRelay-0.1.0-win_amd64-cp315
+cd C:\Temp\SmtpRelay-0.1.0-win_arm64-cp315
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Start
 ```
 
-`install.ps1` locates a Python 3.11+ interpreter (override with
-`-PythonExecutable`), creates `.venv` under `C:\Program Files\SmtpRelay`, installs
-everything with `--no-index --find-links wheels`, seeds
-`C:\ProgramData\SmtpRelay\config.toml` from the template **without overwriting an
-existing one**, tightens that directory's ACLs to SYSTEM and Administrators,
-registers the service as automatic-start with restart-on-failure, and adds an
-Apps & features entry.
+`install.ps1` copies `python/` into `C:\Program Files\SmtpRelay\python`,
+bootstraps pip from the wheel inside that runtime via `ensurepip` (falling back to
+running pip directly out of the bundled wheel), installs everything with
+`--no-index --find-links wheels`, seeds `C:\ProgramData\SmtpRelay\config.toml`
+from the template **without overwriting an existing one**, registers the service
+under a virtual account with least-privilege ACLs, and adds an Apps & features
+entry.
 
-Switches: `-InstallDir`, `-ConfigDir`, `-ServiceName`, `-PythonVersion`,
-`-PythonExecutable`, `-Start`, `-Force`.
+There is **no venv**: the bundled runtime directory *is* the environment. That
+matters for a service, because a venv's `pyvenv.cfg` records `home=` pointing at
+whatever interpreter created it — and if that is the Python Install Manager's
+per-user runtime under `%LOCALAPPDATA%`, a service running under its own account
+ends up depending on one user's profile.
+
+Switches: `-InstallDir`, `-ConfigDir`, `-ServiceName`, `-ServiceAccount`,
+`-ApiPort`, `-OpenFirewall`, `-Start`, `-Force`.
 
 `uninstall.ps1` stops and removes the service, deletes the install directory and
 the Apps & features entry, and **preserves** `C:\ProgramData\SmtpRelay` unless you
 pass `-RemoveConfig`.
 
-The payload must match the target's Python minor version, because `pydantic-core`
-and `pywin32` ship version-specific wheels. `MANIFEST.json` records what it was
-built for and `install.ps1` warns on a mismatch.
+Two things to know about bundling the runtime:
+
+- **The payload must match the machine's architecture**, not just its Python
+  version — there is now no host interpreter to fall back on. `build_dist.py`
+  fetches `pythonarm64` for `win_arm64` and `python` for `win_amd64`; verify with
+  `sysconfig.get_platform()`. `install.ps1` runs the bundled interpreter early and
+  reports a clear error if the architecture is wrong.
+- **The runtime receives no automatic security updates.** Patching CPython means
+  rebuilding the payload with a newer `--runtime-version` and redeploying.
+
+The nuget runtime is used rather than python.org's *embeddable* zip on purpose:
+the embeddable zip ships a `._pth` file with `import site` commented out, which
+stops `.pth` processing — and pywin32 depends on `pywin32.pth` to put `win32` and
+`win32\lib` on `sys.path` and to run `pywin32_bootstrap`. With it, `import
+win32service` fails and the service cannot start. `build_dist.py` refuses a runtime
+containing a `._pth` file, and asserts `ensurepip` is present.
 
 ### Configuration discovery
 
