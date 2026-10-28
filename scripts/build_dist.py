@@ -126,6 +126,52 @@ def read_version() -> str:
     return data["project"]["version"]
 
 
+def bump_version(version: str) -> str:
+    """Increment the patch component: 0.1.0 -> 0.1.1, 0.1.9 -> 0.1.10."""
+    if not isinstance(version, str):
+        raise SystemExit(
+            f"cannot bump {version!r}: expected a version string like 0.1.0. "
+            "Pass --version X.Y.Z to set one explicitly."
+        )
+    parts = version.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise SystemExit(
+            f"cannot bump {version!r}: expected a three-component numeric version. "
+            "Pass --version X.Y.Z to set one explicitly."
+        )
+    parts[2] = str(int(parts[2]) + 1)
+    return ".".join(parts)
+
+
+def write_version(version: str, root: Path = PROJECT_ROOT) -> None:
+    """Write the version to both places that carry it, under ``root``.
+
+    ``pyproject.toml`` and ``app/__init__.py`` must agree - a test asserts it, and
+    the running service reports ``app.__version__`` at ``/health`` while the
+    payload name and Apps & features entry come from pyproject. Called twice per
+    build: once against the staged payload (so it is self-consistent before the
+    manifest hashes it) and once against the project on success.
+    """
+    targets = (
+        (root / "pyproject.toml", r'^version\s*=\s*"[^"]+"', f'version = "{version}"'),
+        (root / "app" / "__init__.py", r'^__version__\s*=\s*"[^"]+"', f'__version__ = "{version}"'),
+    )
+    # Validate every target before writing any of them. Writing as we go would
+    # leave the two files disagreeing if the second pattern stopped matching,
+    # which is worse than failing outright.
+    prepared: list[tuple[Path, str]] = []
+    for path, pattern, replacement in targets:
+        text = path.read_text()
+        # A lambda avoids re.sub interpreting backslashes/group refs in the value.
+        updated, count = re.subn(pattern, lambda _m: replacement, text, count=1, flags=re.M)
+        if count != 1:
+            raise SystemExit(f"could not find the version string in {path}")
+        prepared.append((path, updated))
+
+    for path, updated in prepared:
+        path.write_text(updated)
+
+
 def run(cmd: list[str], *, cwd: Path | None = None) -> None:
     print(f"  $ {' '.join(cmd)}")
     subprocess.run(cmd, check=True, cwd=cwd)
@@ -434,14 +480,35 @@ def main() -> int:
         "--keep-existing", action="store_true",
         help="do not delete an existing payload directory",
     )
+    parser.add_argument(
+        "--version",
+        help="set the version explicitly instead of bumping the patch component",
+    )
+    parser.add_argument(
+        "--no-bump", action="store_true",
+        help="build without incrementing the version (the payload name will repeat)",
+    )
     args = parser.parse_args()
 
-    version = read_version()
+    current = read_version()
+    if args.version:
+        version = args.version
+    elif args.no_bump:
+        version = current
+    else:
+        # Every build gets a distinct version so two payloads can never share a
+        # filename. Without this, five materially different builds were all
+        # "SmtpRelay-0.1.0-win_arm64-cp315.zip" and only a hash distinguished
+        # them - which is how a stale download nearly got installed as current.
+        version = bump_version(current)
+
     python_version = wheel_tag_for(args.runtime_version)
     tag = f"cp{python_version.replace('.', '')}"
     payload = DIST_ROOT / f"SmtpRelay-{version}-{args.platform}-{tag}"
 
     print(f"Building {payload.name} (CPython {args.runtime_version}, {args.platform})")
+    if version != current:
+        print(f"  version {current} -> {version}")
 
     # Fail before downloading anything: a script the target cannot parse is
     # worthless no matter how correct the payload around it is.
@@ -483,6 +550,11 @@ def main() -> int:
     print("  dependency closure verified for the target platform")
 
     stage_source(payload)
+    if version != current:
+        # Patch the staged copies so the payload is internally consistent: its
+        # pyproject.toml, app.__version__ (served at /health), MANIFEST.json and
+        # directory name must all agree. Done before the manifest hashes anything.
+        write_version(version, payload)
     write_manifest(
         payload,
         version=version,
@@ -498,6 +570,13 @@ def main() -> int:
     print(f"\nDone: {payload} ({size / 1e6:.1f} MB)")
     print("Copy the payload to the target and, from an elevated prompt:")
     print("  powershell -ExecutionPolicy Bypass -File .\\install.ps1")
+
+    # Only touch the source tree once the payload actually exists, so a failed
+    # build does not leave a version bump behind with nothing to show for it.
+    if version != current:
+        write_version(version)
+        print(f"\nVersion bumped {current} -> {version} in pyproject.toml and app/__init__.py.")
+        print("Commit it: git add pyproject.toml app/__init__.py")
     return 0
 
 

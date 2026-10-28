@@ -211,6 +211,76 @@ def test_source_files_all_exist():
     assert not missing_dirs, f"SOURCE_DIRS references missing directories: {missing_dirs}"
 
 
+# --- version bumping -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [("0.1.0", "0.1.1"), ("0.1.9", "0.1.10"), ("1.2.3", "1.2.4"), ("0.0.0", "0.0.1")],
+)
+def test_bump_version_increments_the_patch_component(current, expected):
+    assert build_dist.bump_version(current) == expected
+
+
+@pytest.mark.parametrize("bad", ["0.1", "1.2.3.4", "v1.2.3", "latest", "", "0.1.x", None])
+def test_bump_version_rejects_anything_that_is_not_three_numeric_parts(bad):
+    with pytest.raises(SystemExit):
+        build_dist.bump_version(bad)
+
+
+def _versioned_tree(root):
+    (root / "app").mkdir()
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "smtp-relay"\nversion = "0.1.0"\n'
+        'requires-python = ">=3.11"\ndependencies = ["fastapi>=0.115"]\n'
+    )
+    (root / "app" / "__init__.py").write_text('"""Doc."""\n\n__version__ = "0.1.0"\n')
+    return root
+
+
+def test_write_version_keeps_both_sources_in_sync(tmp_path):
+    """/health reports app.__version__; the payload name comes from pyproject."""
+    root = _versioned_tree(tmp_path)
+
+    build_dist.write_version("9.9.9", root)
+
+    assert 'version = "9.9.9"' in (root / "pyproject.toml").read_text()
+    assert '__version__ = "9.9.9"' in (root / "app" / "__init__.py").read_text()
+
+
+def test_write_version_leaves_other_version_strings_alone(tmp_path):
+    root = _versioned_tree(tmp_path)
+
+    build_dist.write_version("0.2.0", root)
+
+    text = (root / "pyproject.toml").read_text()
+    assert 'requires-python = ">=3.11"' in text
+    assert "fastapi>=0.115" in text
+    assert text.count('version = "0.2.0"') == 1
+
+
+def test_write_version_is_atomic_across_both_files(tmp_path):
+    """A missing pattern must not leave pyproject and __init__ disagreeing."""
+    root = tmp_path
+    (root / "app").mkdir()
+    # Single quotes: the double-quoted pattern will not match.
+    (root / "pyproject.toml").write_text("[project]\nversion = '0.1.0'\n")
+    init = root / "app" / "__init__.py"
+    init.write_text('__version__ = "0.1.0"\n')
+
+    with pytest.raises(SystemExit):
+        build_dist.write_version("1.0.0", root)
+
+    assert init.read_text() == '__version__ = "0.1.0"\n', "second file was written despite the first failing"
+
+
+def test_project_version_sources_currently_agree():
+    """The invariant write_version maintains, checked against the real tree."""
+    import app
+
+    assert build_dist.read_version() == app.__version__
+
+
 def test_installer_scripts_are_present():
     scripts = sorted(p.name for p in build_dist.INSTALLER_DIR.glob("*.ps1"))
 

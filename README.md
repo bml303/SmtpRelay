@@ -400,6 +400,19 @@ mis-resolves.
 The wheel tag is **derived** from `--runtime-version` rather than specified
 separately, so the wheels cannot disagree with the bundled interpreter.
 
+**Each build bumps the patch version** — `0.1.0` → `0.1.1` — in both
+`pyproject.toml` and `app/__init__.py`, so no two payloads ever share a filename.
+That matters more than it sounds: while the version stayed fixed, five materially
+different builds were all named `SmtpRelay-0.1.0-win_arm64-cp315.zip` and only a
+sha256 told them apart, which is how a stale download nearly got installed as the
+current one. The bump is written to the source tree only *after* the payload is
+built successfully, and into the staged copy beforehand so the payload's
+`pyproject.toml`, `app.__version__` (served at `/health`), `MANIFEST.json` and
+directory name all agree. Commit the bump with your source changes.
+
+Use `--version X.Y.Z` to set one explicitly, or `--no-bump` to rebuild without
+incrementing (the payload name will then repeat and be overwritten).
+
 The result is `dist/SmtpRelay-<version>-<platform>-<tag>/`:
 
 ```
@@ -420,7 +433,7 @@ MANIFEST.json          version, runtime_version, target, per-file sha256, payloa
 Copy the directory to the target and, from an **elevated** prompt:
 
 ```powershell
-cd C:\Temp\SmtpRelay-0.1.0-win_arm64-cp315
+cd C:\Temp\SmtpRelay-0.1.1-win_arm64-cp315
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Start
 ```
 
