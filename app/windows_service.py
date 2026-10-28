@@ -42,7 +42,7 @@ import win32service
 import win32serviceutil
 
 from .config import ConfigError, load_config
-from .logging_setup import configure_event_log_logging
+from .logging_setup import configure_event_log_logging, configure_stderr_logging
 from .main import create_app
 
 #: How long to let uvicorn drain connections after a stop request.
@@ -79,7 +79,13 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
         win32event.SetEvent(self._stop_requested)
 
     def SvcDoRun(self) -> None:
-        configure_event_log_logging()
+        # `debug` runs this same method in a console. Logging to the event log
+        # there would hide the very errors debug mode exists to reveal, so the
+        # console gets stderr and only the real service uses the event log.
+        if "debug" in sys.argv:
+            configure_stderr_logging()
+        else:
+            configure_event_log_logging()
         servicemanager.LogInfoMsg(f"{self._svc_display_name} starting")
 
         try:

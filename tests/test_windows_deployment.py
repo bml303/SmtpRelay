@@ -39,8 +39,8 @@ def test_importing_off_windows_fails_with_an_actionable_message():
     assert "pywin32" in message
 
 
-def test_requirements_guard_platform_specific_packages():
-    """uvloop ships no Windows wheels, so it must not be pinned unconditionally."""
+def _pinned_entries() -> dict[str, str]:
+    """Map normalized package name -> environment marker ("" when unmarked)."""
     entries: dict[str, str] = {}
     for line in (PROJECT_ROOT / "requirements.txt").read_text().splitlines():
         line = line.strip()
@@ -49,29 +49,66 @@ def test_requirements_guard_platform_specific_packages():
         spec, _, marker = line.partition(";")
         name = spec.split("==")[0].strip().lower().replace("_", "-")
         entries[name] = marker.strip()
+    return entries
 
-    assert "sys_platform != 'win32'" in entries["uvloop"]
+
+#: Packages that exist only because of uvicorn's [standard] extra. None is used
+#: by this relay, and PyYAML among them has no win_amd64 wheel for cp3.15 and no
+#: win_arm64 wheel for cp3.11 - so pinning it silently turns a Windows install
+#: into a source build requiring Visual Studio Build Tools for C++.
+UVICORN_STANDARD_ONLY = {
+    "httptools",
+    "python-dotenv",
+    "pyyaml",
+    "uvloop",
+    "watchfiles",
+    "websockets",
+}
+
+
+def test_requirements_do_not_pull_the_uvicorn_standard_extra():
+    """Regression guard for the MSVC Build Tools requirement on Windows."""
+    present = sorted(UVICORN_STANDARD_ONLY & set(_pinned_entries()))
+
+    assert not present, (
+        f"these exist only via uvicorn[standard] and force a C/C++ compiler on "
+        f"Windows: {present}"
+    )
+
+
+def test_pyproject_declares_plain_uvicorn():
+    """The lockfile above only stays compiler-free if this declaration holds."""
+    data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+
+    uvicorn_reqs = [r for r in data["project"]["dependencies"] if r.startswith("uvicorn")]
+
+    assert uvicorn_reqs, "uvicorn is not declared as a runtime dependency"
+    for requirement in uvicorn_reqs:
+        assert "[standard]" not in requirement, requirement
+
+
+def test_pywin32_is_the_only_platform_specific_pin():
+    """With plain uvicorn the set is cross-platform; only pywin32 needs a marker."""
+    entries = _pinned_entries()
+
     assert "sys_platform == 'win32'" in entries["pywin32"]
 
+    marked = {name for name, marker in entries.items() if marker}
+    assert marked == {"pywin32"}, f"unexpected platform-marked pins: {sorted(marked)}"
 
-def test_every_pinned_package_is_installable_on_windows():
-    """Nothing besides uvloop may be pinned without a Windows-compatible marker.
 
-    Guards against re-introducing the flat `pip freeze` regression, where a
-    Linux-only package silently made the lockfile uninstallable on Windows.
+def test_only_well_wheeled_packages_remain_compiled():
+    """Everything else must be pure Python or have universal Windows wheels.
+
+    pydantic-core and pywin32 are the only compiled packages left, and both
+    publish wheels across win_amd64/win_arm64 for cp311-cp315.
     """
-    unix_only = {"uvloop"}
-    offenders = []
-    for line in (PROJECT_ROOT / "requirements.txt").read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        spec, _, marker = line.partition(";")
-        name = spec.split("==")[0].strip().lower().replace("_", "-")
-        if name in unix_only and "win32" not in marker:
-            offenders.append(line)
+    known_compiled = {"pydantic-core", "pywin32"}
+    entries = _pinned_entries()
 
-    assert not offenders, f"Unix-only packages pinned without a marker: {offenders}"
+    assert known_compiled <= set(entries), "expected compiled packages went missing"
+    # httptools/PyYAML/watchfiles/websockets were the other compiled ones.
+    assert not (UVICORN_STANDARD_ONLY & set(entries))
 
 
 def test_pyproject_windows_extra_is_platform_guarded():

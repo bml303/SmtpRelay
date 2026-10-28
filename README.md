@@ -32,6 +32,27 @@ touching `pyproject.toml`:
 .venv/bin/python -m pip freeze --exclude-editable > requirements.txt
 ```
 
+### Dependencies
+
+Three runtime packages — `fastapi`, `uvicorn`, `pydantic[email]` — plus dev extras.
+
+`uvicorn` is deliberately installed **without** its `[standard]` extra. That extra
+pulls in `httptools`, `PyYAML`, `watchfiles`, `websockets`, `python-dotenv` and
+`uvloop`, none of which this relay uses: config is TOML, there is no `--reload`, no
+WebSocket endpoint and no `.env` file.
+
+Excluding it matters on Windows. `PyYAML` publishes no `win_amd64` wheel for CPython
+3.15 and no `win_arm64` wheel for 3.11, so it turns `pip install` into a source
+build demanding **Visual Studio Build Tools for C++** — to compile a module the
+relay never imports. Without the extra, `pydantic-core` and `pywin32` are the only
+compiled dependencies and both have complete wheels, so **no C/C++ compiler is
+needed on any of win_amd64/win_arm64 × CPython 3.11–3.15**. uvicorn then serves
+over its pure-Python `h11` protocol instead of `httptools`, which is irrelevant at
+mail-relay volumes (verified live with 200 KB and 2 MB request bodies).
+
+`tests/test_windows_deployment.py` fails if any of those six packages reappears in
+`requirements.txt`, or if `pyproject.toml` re-declares `uvicorn[standard]`.
+
 The API docs are served at <http://127.0.0.1:8000/docs>, the raw OpenAPI schema at
 `/openapi.json`, and a liveness probe at `/health`.
 

@@ -1,16 +1,24 @@
 # Pinned dependency set for smtp-relay.
 #
 # Every version is exact, so a fresh install reproduces this environment.
-# This file is cross-platform: the two entries at the bottom carry environment
-# markers, so it installs correctly on both Linux and Windows.
+# This file installs on Linux and Windows WITHOUT a C/C++ compiler: the only
+# compiled packages are pydantic-core and pywin32, and both have complete wheels
+# for win_amd64 and win_arm64 across cp311-cp315.
+#
+# That property depends on uvicorn being declared WITHOUT its [standard] extra.
+# The extra pulls in httptools, PyYAML, watchfiles, websockets, python-dotenv and
+# uvloop; PyYAML has no win_amd64 wheel for cp3.15 and no win_arm64 wheel for
+# cp3.11, which silently turns `pip install` into a source build requiring
+# Visual Studio Build Tools for C++. None of those six are used here.
+# tests/test_windows_deployment.py guards against reintroducing them.
 #
 # Regenerate after changing pyproject.toml:
 #   .venv/bin/python -m pip install -e '.[dev]'
 #   .venv/bin/python -m pip freeze --exclude-editable > requirements.txt
 #
 # WARNING: `pip freeze` runs on the current platform only. Regenerating on Linux
-# drops the Windows entry and strips uvloop's marker, so after regenerating you
-# must restore the "platform-specific" block at the bottom of this file.
+# drops the Windows entry below, so after regenerating you must restore the
+# "platform-specific" block at the bottom of this file.
 #
 # Note: this is a single flat file, so it includes the test-only packages
 # (pytest, httpx, aiosmtpd). For a production install that skips them, use
@@ -19,6 +27,7 @@
 # The project itself is intentionally absent (--exclude-editable); install it
 # with `pip install .` or `pip install -e .` after these requirements.
 
+aiosmtpd==1.4.6
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -31,7 +40,6 @@ email-validator==2.3.0
 fastapi==0.162.0
 h11==0.16.0
 httpcore==1.0.9
-httptools==0.9.0
 httpx==0.28.1
 idna==3.20
 iniconfig==2.3.1
@@ -42,19 +50,11 @@ pydantic==2.14.1
 pydantic_core==2.50.1
 Pygments==2.21.0
 pytest==9.2.0
-python-dotenv==1.2.4
-PyYAML==6.0.3
 starlette==1.10.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.54.0
-watchfiles==1.3.0
-websockets==17.3
 
 # --- platform-specific -------------------------------------------------
-# uvloop publishes no Windows wheels (libuv-based, Unix only); uvicorn's own
-# metadata guards it with the same marker.
-uvloop==0.23.0; sys_platform != 'win32' and sys_platform != 'cygwin'
-
 # pywin32 is required only for the native Windows service (app/windows_service.py).
 pywin32==312; sys_platform == 'win32'
