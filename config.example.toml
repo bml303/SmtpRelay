@@ -1,0 +1,38 @@
+# SMTP relay configuration.
+#
+# Every value can be overridden by an environment variable; env wins over this
+# file. Keep secrets in the environment, not here. See README.md for the full
+# list of RELAY_* variables.
+
+[api]
+host = "127.0.0.1"
+port = 8000
+# Optional. When set, clients must send "Authorization: Bearer <token>".
+# Prefer RELAY_API_TOKEN over writing the token into this file.
+# token = "change-me"
+max_recipients = 50
+
+[smtp]
+host = "mail.example.com"
+# 465 = implicit TLS, 587 = STARTTLS, 25 = usually plaintext
+port = 587
+# "starttls" | "tls" | "none". Omit to infer from the port above.
+# security = "starttls"
+# username = "relay@example.com"
+# Password: use RELAY_SMTP_PASSWORD rather than this file.
+# password = ""
+timeout = 30.0
+# Extra CA bundle for an internal PKI. Omit to use the system trust store.
+# ca_file = "/etc/ssl/certs/internal-ca.pem"
+# Name sent in EHLO/HELO. Defaults to the local FQDN.
+# local_hostname = "relay.example.com"
+
+[policy]
+sender = "relay@example.com"
+# sender_name = "Notification Relay"
+# Recipient domains permitted by POST /mail. Empty = reject everything.
+allowed_domains = ["example.com", "example.org"]
+# When true, an entry also covers its subdomains (mail.example.com).
+allow_subdomains = false
+# Reject subjects/bodies that look like base64 blobs rather than plain text.
+reject_base64 = true
