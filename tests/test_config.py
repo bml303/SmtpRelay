@@ -76,6 +76,8 @@ host = "0.0.0.0"
 port = 9000
 token = "abc"
 max_recipients = 10
+ssl_certfile = "/etc/ssl/certs/relay.crt"
+ssl_keyfile = "/etc/ssl/private/relay.key"
 
 [smtp]
 host = "mail.example.com"
@@ -100,6 +102,8 @@ reject_base64 = false
     assert config.api.port == 9000
     assert config.api.token == "abc"
     assert config.api.max_recipients == 10
+    assert config.api.ssl_certfile == Path("/etc/ssl/certs/relay.crt")
+    assert config.api.ssl_keyfile == Path("/etc/ssl/private/relay.key")
     assert config.smtp.resolved_security == "starttls"
     assert config.smtp.username == "relay"
     assert config.smtp.password == "pw"

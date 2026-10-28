@@ -5,18 +5,28 @@
 # list of RELAY_* variables.
 
 [api]
+# Loopback by default: nothing off this machine can reach the API.
+# Binding anything else (0.0.0.0, ::, a LAN address) makes the service
+# network-reachable, and the app then REFUSES TO START unless both are set:
+#   1. ssl_certfile            - otherwise the bearer token and message bodies
+#                                cross the network in cleartext
+#   2. token, or ssl_cert_reqs = "required"
+#                              - otherwise any host that can reach the port can
+#                                relay mail, i.e. an open relay
+# That check runs in AppConfig, so no entry point can bypass it.
 host = "127.0.0.1"
 port = 8000
-# Optional. When set, clients must send "Authorization: Bearer <token>".
+# Optional on loopback; REQUIRED (or mTLS) when api.host is not loopback.
 # Prefer RELAY_API_TOKEN over writing the token into this file.
 # token = "change-me"
 max_recipients = 50
 
 # Inbound TLS for the REST API itself. Off by default: with api.host bound to
 # 127.0.0.1 the API is loopback-only and never crosses the network, so TLS buys
-# nothing. Enable it only if remote clients will connect directly (i.e. you are
-# not terminating TLS in a reverse proxy in front of this service).
-# Setting ssl_certfile switches the endpoint to HTTPS.
+# nothing. Enable it when remote clients connect directly (i.e. you are not
+# terminating TLS in a reverse proxy in front of this service).
+# Setting ssl_certfile switches the endpoint to HTTPS. The certificate's SAN must
+# match the hostname clients use, or their TLS verification will fail.
 # ssl_certfile = "/etc/ssl/certs/smtp-relay.crt"
 # ssl_keyfile = "/etc/ssl/private/smtp-relay.key"
 # Passphrase for an encrypted key. Prefer RELAY_API_SSL_KEYFILE_PASSWORD.

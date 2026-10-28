@@ -33,8 +33,16 @@ param(
     [string] $InstallDir  = (Join-Path $env:ProgramFiles 'SmtpRelay'),
     [string] $ConfigDir   = (Join-Path $env:ProgramData 'SmtpRelay'),
     [string] $ServiceName = 'SmtpRelay',
+    # Virtual service account: a per-service SID with no admin rights and no
+    # password to rotate. It still presents the computer account on the network,
+    # so NTLM/Kerberos SMTP auth works. Unlike NetworkService it is not shared
+    # with every other service on the box, so the ACL grants below are readable
+    # by this service alone.
+    [string] $ServiceAccount = "NT SERVICE\$ServiceName",
     [string] $PythonVersion = '3.15',
     [string] $PythonExecutable,
+    [int]    $ApiPort = 8000,
+    [switch] $OpenFirewall,
     [switch] $Start,
     [switch] $Force
 )
@@ -195,15 +203,11 @@ if (Test-Path $configFile) {
     Write-Warn2 "  notepad `"$configFile`""
 }
 
-# ProgramData subfolders inherit read access for standard users. The service runs
-# as LocalSystem, so removing Users access does not affect it.
-try {
-    & icacls.exe $ConfigDir /inheritance:r /grant 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Ok "ACLs tightened to SYSTEM + Administrators" }
-    else { Write-Warn2 "icacls exited $LASTEXITCODE; ACLs left at default." }
-} catch {
-    Write-Warn2 "Could not tighten ACLs: $($_.Exception.Message)"
-}
+# ACLs are applied after service registration, in the "Permissions" step below:
+# the virtual service account SID (NT SERVICE\<name>) must exist before it can be
+# granted anything, and granting only SYSTEM/Administrators here would lock the
+# service out of its own configuration.
+Write-Ok "ACLs applied after service registration"
 
 # ------------------------------------------------------------------ service
 
@@ -225,6 +229,66 @@ Write-Ok "Service registered"
 & sc.exe config $ServiceName start= auto | Out-Null
 & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
 Write-Ok "Start type: automatic; restart on failure enabled"
+
+# -------------------------------------------------------------- permissions
+
+Write-Step "Applying least-privilege permissions"
+
+# A virtual service account needs no password, and the SCM grants it
+# SeServiceLogonRight automatically. A *named* account would additionally need
+# that right granted in secpol.msc, or the service fails to start with error
+# 1069 ("The service did not start due to a logon failure") - pywin32 does not
+# grant it for you.
+& sc.exe config $ServiceName obj= $ServiceAccount | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Stop-WithError "sc.exe could not set the account to '$ServiceAccount' (exit $LASTEXITCODE)." `
+        "Re-run with -ServiceAccount 'NT AUTHORITY\NetworkService' to fall back."
+}
+Write-Ok "Service account: $ServiceAccount"
+
+# The SID contains a space, so icacls needs the identity quoted while the
+# permission bits stay outside the quotes.
+$grantInstall = "`"$ServiceAccount`":(OI)(CI)RX"
+$grantConfig  = "`"$ServiceAccount`":(OI)(CI)R"
+
+& icacls.exe $InstallDir /grant $grantInstall | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 "Could not grant read+execute on '$InstallDir' (icacls exit $LASTEXITCODE)."
+} else {
+    Write-Ok "read+execute on $InstallDir"
+}
+
+# Strip inheritance on the config dir: it may hold an SMTP password or API token,
+# and ProgramData subfolders otherwise inherit read access for standard users.
+& icacls.exe $ConfigDir /inheritance:r `
+    /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' /grant $grantConfig | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 "Could not tighten ACLs on '$ConfigDir' (icacls exit $LASTEXITCODE)."
+} else {
+    Write-Ok "$ConfigDir : SYSTEM+Administrators full, service read-only"
+}
+# Note the service gets no write access anywhere: it logs to the Event Log, so it
+# never needs to create a file.
+
+# ------------------------------------------------------------------ firewall
+
+if ($OpenFirewall) {
+    Write-Step "Opening inbound TCP $ApiPort"
+    try {
+        New-NetFirewallRule -DisplayName "SMTP Relay ($ServiceName)" `
+            -Direction Inbound -Protocol TCP -LocalPort $ApiPort -Action Allow | Out-Null
+        Write-Ok "Inbound rule created for TCP $ApiPort"
+        Write-Warn2 "Make sure api.port in config.toml matches $ApiPort."
+    } catch {
+        Write-Warn2 "Could not create the firewall rule: $($_.Exception.Message)"
+    }
+} else {
+    Write-Step "Firewall"
+    Write-Ok "Skipped - pass -OpenFirewall to allow inbound TCP $ApiPort"
+    Write-Warn2 "Only needed if api.host is bound to something other than 127.0.0.1."
+    Write-Warn2 "Before doing that, check the port is not in a WinNAT exclusion:"
+    Write-Warn2 "  netsh int ipv4 show excludedportrange protocol=tcp"
+}
 
 # Add/Remove Programs entry.
 $uninstallScript = Join-Path $InstallDir 'uninstall.ps1'
@@ -261,6 +325,7 @@ Installation complete.
   Program files : $InstallDir
   Configuration : $configFile
   Service name  : $ServiceName
+  Runs as       : $ServiceAccount
   Python        : $VenvPython
 
 Next steps:
@@ -270,7 +335,14 @@ Next steps:
   4. Start the service:        & '$VenvPython' -m app.windows_service start
   5. Read the logs:            Get-EventLog -LogName Application -Source SmtpRelay -Newest 20
 
-The API binds 127.0.0.1:8000 by default, so no firewall rule is needed. Do not
-open the port without first enabling api.ssl_certfile - the bearer token would
-otherwise cross the network in cleartext.
+Exposing the API beyond this machine:
+  - set api.host in config.toml to the interface you want (e.g. 0.0.0.0)
+  - set api.ssl_certfile / api.ssl_keyfile, and api.token or
+    api.ssl_cert_reqs = "required"
+  - re-run install.ps1 with -OpenFirewall (or add the rule yourself)
+
+The application refuses to start if api.host is non-loopback without both TLS and
+client authentication, so it cannot silently become a cleartext open relay. Before
+picking a port, confirm it is outside the WinNAT exclusion ranges:
+  netsh int ipv4 show excludedportrange protocol=tcp
 "@ -ForegroundColor Green

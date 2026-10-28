@@ -175,12 +175,59 @@ class PolicyConfig(BaseModel):
     reject_base64: bool = True
 
 
+#: Hosts reachable only from the local machine. Binding anything else puts the
+#: API on the network.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     api: ApiConfig = Field(default_factory=ApiConfig)
     smtp: SmtpConfig
     policy: PolicyConfig
+
+    @model_validator(mode="after")
+    def _network_exposure_needs_tls_and_auth(self) -> "AppConfig":
+        """Refuse to come up as a network-reachable cleartext open relay.
+
+        Enforced here rather than in the installer so that no entry point -
+        ``python -m app``, the Windows service, or a hand-written uvicorn
+        command - can bypass it.
+
+        Binding a non-loopback address has two consequences that must both be
+        addressed: requests (including the bearer token and message bodies)
+        cross the network, and any host that can reach the port can submit mail.
+        The second is what makes an unauthenticated relay an *open* relay: the
+        domain allowlist still constrains destinations, but anyone on the network
+        gets to use them.
+
+        ``ssl_cert_reqs = "optional"`` does not count as authentication - clients
+        may simply present no certificate - so only a bearer token or required
+        mutual TLS satisfies the check.
+        """
+        if self.api.host in LOOPBACK_HOSTS:
+            return self
+
+        problems = []
+        if not self.api.tls_enabled:
+            problems.append(
+                "api.ssl_certfile is unset, so traffic including the bearer "
+                "token would cross the network in cleartext"
+            )
+        authenticates = self.api.token is not None or self.api.ssl_cert_reqs == "required"
+        if not authenticates:
+            problems.append(
+                'neither api.token nor mutual TLS (ssl_cert_reqs = "required") is '
+                "configured, so any host on the network could relay mail through it"
+            )
+        if problems:
+            raise ValueError(
+                f"api.host = {self.api.host!r} is reachable from the network, but "
+                + "; and ".join(problems)
+                + '. Bind api.host to 127.0.0.1, or configure both.'
+            )
+        return self
 
 
 #: Scalar/optional overrides. ``RELAY_ALLOWED_DOMAINS`` is handled separately

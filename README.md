@@ -275,14 +275,17 @@ encoding applied by every mail client, and is unrelated to the API-level rule ab
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest          # 157 tests
+.venv/bin/python -m pytest          # 172 tests
 ```
 
-Five layers:
+Six layers:
 
 - **unit** (`test_policy.py`, `test_config.py`, `test_logging_setup.py`) —
   allowlist matching, the base64 heuristic, TOML loading, env overrides, and the
   config search paths.
+- **security policy** (`test_network_exposure.py`) — a non-loopback `api.host`
+  requires both TLS and client authentication, and `ssl_cert_reqs = "optional"`
+  does not count as the latter.
 - **mocked SMTP** (`test_relay.py`) — negotiation order for each security mode,
   error translation, socket cleanup on failure.
 - **integration** (`test_integration.py`) — the whole stack against a real
@@ -293,9 +296,10 @@ Five layers:
   cert, client cert, and a *rogue* CA with its own client cert) and asserts that a
   trusted client certificate is accepted while a missing or rogue-CA one is
   refused during the handshake. Skips cleanly where `openssl` is unavailable.
-- **packaging** (`test_windows_deployment.py`) — the service module compiles, and
-  every platform-specific pin carries the marker that keeps `requirements.txt`
-  installable on Windows.
+- **packaging** (`test_windows_deployment.py`, `test_build_dist.py`) — the service
+  module compiles, `SERVICE_CLASS_STRING` resolves to a real importable module,
+  every platform-specific pin carries its marker, no `uvicorn[standard]` package
+  can reappear, and the payload staging allowlist cannot leak `config.toml`.
 
 Note that the test CA carries `keyUsage=critical,keyCertSign,cRLSign`. Python 3.13
 turned on `VERIFY_X509_STRICT` in `ssl.create_default_context()`, so a CA that signs
@@ -442,14 +446,20 @@ checkout, where `app/` sits in the repository and `PACKAGE_ROOT` is the project
 root; it is not a deployment location.
 
 `ProgramData` subfolders also inherit read access for standard users, so harden the
-directory if the config carries credentials:
+directory if the config carries credentials — but keep read access for the service
+account, or it cannot read its own configuration:
 
 ```powershell
 icacls "C:\ProgramData\SmtpRelay" /inheritance:r `
-  /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+  /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" `
+  /grant '"NT SERVICE\SmtpRelay":(OI)(CI)R'
 ```
 
-The service runs as LocalSystem, so removing `Users` access does not affect it.
+Note the quoting: the identity contains a space, so it is quoted while the
+permission bits stay outside the quotes. `install.ps1` does this for you, and
+grants the service **read-only** access — it never writes to disk, since logs go to
+the Event Log.
+
 Better still, keep secrets out of the file entirely and supply them as
 `RELAY_SMTP_PASSWORD` / `RELAY_API_TOKEN` — though note a system environment
 variable is also readable by local users, so for a genuinely hostile box prefer a
@@ -482,20 +492,67 @@ uses. It deliberately does not inspect `sys.argv`: the non-frozen debug path
 launches `pythonservice.exe -debug <name>`, so argv contains `-debug` rather than
 `debug` and an equality test silently misses.
 
+### Service account
+
+The service runs as the **virtual service account** `NT SERVICE\SmtpRelay`, not
+LocalSystem. LocalSystem carries `SeTcbPrivilege`, full local administrative rights
+and acts as the computer on the network — far more than a process that reads one
+config file, binds a socket and makes outbound SMTP connections needs.
+
+A virtual account is preferable to `NetworkService` because its SID is unique to
+this service. `NetworkService` is shared by every service configured with it, so
+anything granted to NetworkService is readable by all of them — including this
+service's SMTP credentials. A per-service SID can be granted exactly what it needs.
+
+Both present the **computer account** for network authentication, so NTLM/Kerberos
+SMTP auth still works. `LocalService` is the one to avoid: it presents *anonymous*
+credentials on the network.
+
+`install.ps1` sets it with `sc.exe config SmtpRelay obj= "NT Service\SmtpRelay"`
+and then grants:
+
+| Path | Grant |
+|---|---|
+| `C:\Program Files\SmtpRelay` | read + execute, additive (Program Files inheritance left intact) |
+| `C:\ProgramData\SmtpRelay` | read only, inheritance stripped |
+
+No write access anywhere — the service logs to the Event Log, so it never creates a
+file. Override the account with `-ServiceAccount`.
+
+Two gotchas:
+
+- The SID must exist before it can be granted anything, so ACLs are applied
+  **after** service registration, not during the config step.
+- pywin32 does **not** grant `SeServiceLogonRight`. Virtual and built-in accounts
+  receive it automatically, but a *named* account needs it granted in `secpol.msc`
+  first, or the service fails with error 1069 ("the service did not start due to a
+  logon failure") and nothing in the message explains why.
+
 ### Operational notes
 
-- **Firewall** — the API binds `127.0.0.1` by default, so it is reachable only
-  from the local machine and **no inbound rule is needed**. Only if you set
-  `api.host = "0.0.0.0"` do remote clients come into play, and you should enable
-  API TLS before opening the port, otherwise the bearer token crosses the network
-  in cleartext:
+- **Network exposure is guarded** — setting `api.host` to anything other than
+  `127.0.0.1`, `localhost` or `::1` makes the app refuse to start unless TLS
+  (`ssl_certfile`) *and* client authentication (`token`, or
+  `ssl_cert_reqs = "required"`) are both configured. Without the second, any host
+  that can reach the port could relay mail to every allowlisted domain — an open
+  relay. `ssl_cert_reqs = "optional"` does not satisfy it, since a client may
+  present no certificate at all. The check lives in `AppConfig`, so no entry point
+  can bypass it.
+- **Firewall** — the API binds `127.0.0.1` by default, so it is reachable only from
+  the local machine and **no inbound rule is needed**. To expose it, pass
+  `-OpenFirewall` to `install.ps1`, or add the rule yourself:
   ```powershell
   New-NetFirewallRule -DisplayName "SMTP Relay" -Direction Inbound `
     -LocalPort 8000 -Protocol TCP -Action Allow
   ```
-- **Service account** — runs as LocalSystem by default, which has the outbound
-  network access SMTP needs. Only change it (`sc.exe config SmtpRelay obj= ...`)
-  if your mailhost requires a specific identity.
+  Windows has **no privileged-port concept** — binding 25 or 80 needs nothing
+  special — so a high port is collision avoidance, not a security boundary. The
+  port trap that *is* Windows-specific is WinNAT: with Hyper-V or WSL2 enabled,
+  Windows reserves arbitrary TCP ranges, and binding inside one fails with
+  `WinError 10013` or `10048` even though nothing is listening. Check first:
+  ```powershell
+  netsh int ipv4 show excludedportrange protocol=tcp
+  ```
 - **Certificates** — `ssl.create_default_context()` reads the Windows certificate
   store, so an internal CA already trusted by Windows needs no `ca_file` at all.
   Validation is always on; there is no option to disable it.
