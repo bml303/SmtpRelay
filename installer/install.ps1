@@ -277,9 +277,9 @@ if ($aclFailures.Count -gt 0) {
     # runtime or configuration, and would fail at start with an unrelated error.
     Stop-WithError ("Could not set permissions on: " + ($aclFailures -join '; ') + ".") `
         ("Run these elevated, then start the service:`n" +
-         "  icacls `"$InstallDir`" /grant `"NT SERVICE\$ServiceName:(OI)(CI)RX`"`n" +
+         "  icacls `"$InstallDir`" /grant `"NT SERVICE\${ServiceName}:(OI)(CI)RX`"`n" +
          "  icacls `"$ConfigDir`" /inheritance:r /grant `"SYSTEM:(OI)(CI)F`" " +
-         "/grant `"Administrators:(OI)(CI)F`" /grant `"NT SERVICE\$ServiceName:(OI)(CI)R`"")
+         "/grant `"Administrators:(OI)(CI)F`" /grant `"NT SERVICE\${ServiceName}:(OI)(CI)R`"")
 }
 
 # ------------------------------------------------------------------ firewall

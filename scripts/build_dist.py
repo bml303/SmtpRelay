@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -58,6 +59,66 @@ RUNTIME_DIRNAME = "python"
 BUILD_BACKEND_PACKAGES = ["pip", "setuptools>=68", "wheel"]
 
 DEFAULT_RUNTIME_VERSION = "3.15.2"
+
+
+def find_pwsh() -> str | None:
+    """Locate a PowerShell interpreter, for syntax-checking the installer."""
+    override = os.environ.get("PWSH")
+    if override and Path(override).is_file():
+        return override
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+#: Uses the real PowerShell parser. __PATHS__ is substituted with a literal array.
+_PARSE_PROBE = (
+    "$fail=$false;"
+    "foreach($p in @(__PATHS__)){"
+    "$e=$null;$t=$null;"
+    "[System.Management.Automation.Language.Parser]::ParseFile($p,[ref]$t,[ref]$e)|Out-Null;"
+    "if($e -and $e.Count -gt 0){$fail=$true;Write-Host \"PARSE FAIL: $p\";"
+    "foreach($x in $e){Write-Host ('  line {0}: {1}' -f $x.Extent.StartLineNumber,$x.Message)}}"
+    "else{Write-Host \"  parsed OK: $p\"}};"
+    "if($fail){exit 1}else{exit 0}"
+)
+
+
+def validate_powershell_syntax(scripts: list[Path]) -> None:
+    """Parse-check the installer scripts when a PowerShell is available.
+
+    A PowerShell *parse* error means the script never runs at all - not even its
+    first line - so on the target it appears as a wall of parser output instead of
+    a usable diagnostic. Three such bugs shipped before this check existed; the
+    last was ``$ServiceName:(OI)(CI)RX`` inside a hint string, which the parser
+    rejects as an invalid drive-qualified variable reference.
+
+    Skipped with a loud warning when no interpreter is found. Set ``PWSH`` to the
+    path of one - the self-contained Linux tarball works fine - so that builds on
+    a Linux host are checked too.
+    """
+    if not scripts:
+        return
+    pwsh = find_pwsh()
+    if pwsh is None:
+        print(
+            "  WARNING: no pwsh found - installer scripts were NOT syntax-checked. "
+            "Set PWSH=/path/to/pwsh to enable this."
+        )
+        return
+
+    paths = ",".join("'{}'".format(str(s).replace("'", "''")) for s in scripts)
+    probe = _PARSE_PROBE.replace("__PATHS__", paths)
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-Command", probe],
+        capture_output=True,
+        text=True,
+    )
+    for line in (result.stdout or "").strip().splitlines():
+        print(f"  {line}")
+    if result.returncode != 0:
+        raise SystemExit(
+            "Installer scripts have PowerShell syntax errors (above). A parse "
+            "error means the script will not run at all on the target."
+        )
 
 
 def read_version() -> str:
@@ -381,6 +442,12 @@ def main() -> int:
     payload = DIST_ROOT / f"SmtpRelay-{version}-{args.platform}-{tag}"
 
     print(f"Building {payload.name} (CPython {args.runtime_version}, {args.platform})")
+
+    # Fail before downloading anything: a script the target cannot parse is
+    # worthless no matter how correct the payload around it is.
+    print("Syntax-checking installer scripts")
+    validate_powershell_syntax(sorted(INSTALLER_DIR.glob("*.ps1")))
+
     if payload.exists():
         if args.keep_existing:
             print("  reusing existing payload directory")

@@ -329,6 +329,24 @@ def test_uninstaller_uses_the_bundled_runtime():
     assert ".venv" not in script
 
 
+def test_installer_scripts_have_valid_powershell_syntax():
+    """A parse error means the script never runs - not even its first line.
+
+    Three PowerShell bugs shipped before this guard existed. The last was
+    `$ServiceName:(OI)(CI)RX` inside a hint string: PowerShell reads `$Name:` as a
+    drive-qualified variable reference and rejects the whole file, so the target
+    saw a wall of parser output and the installer did nothing at all.
+    """
+    if build_dist.find_pwsh() is None:
+        pytest.skip("no pwsh available; set PWSH=/path/to/pwsh to enable this check")
+
+    scripts = sorted(build_dist.INSTALLER_DIR.glob("*.ps1"))
+    assert scripts, "no installer scripts found"
+
+    # Raises SystemExit if any script fails to parse.
+    build_dist.validate_powershell_syntax(scripts)
+
+
 def test_uninstaller_removes_every_artifact_the_installer_creates():
     """A clean-slate reinstall must leave no residue behind.
 
