@@ -20,10 +20,21 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    logging.getLogger("smtp_relay").info(
-        "Relaying via %s (%s)", settings.smtp.endpoint, settings.smtp.resolved_security
+    logger = logging.getLogger("smtp_relay")
+    logger.info(
+        "Listening on %s://%s:%s, relaying via %s (%s)",
+        settings.api.scheme,
+        settings.api.host,
+        settings.api.port,
+        settings.smtp.endpoint,
+        settings.smtp.resolved_security,
     )
-    uvicorn.run(create_app(settings), host=settings.api.host, port=settings.api.port)
+    uvicorn.run(
+        create_app(settings),
+        host=settings.api.host,
+        port=settings.api.port,
+        **settings.api.uvicorn_ssl_kwargs(),
+    )
     return 0
 
 

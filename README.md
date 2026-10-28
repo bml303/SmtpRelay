@@ -109,6 +109,11 @@ annotated template.
 | `RELAY_API_PORT` | `api.port` |
 | `RELAY_API_TOKEN` | `api.token` |
 | `RELAY_MAX_RECIPIENTS` | `api.max_recipients` |
+| `RELAY_API_SSL_CERTFILE` | `api.ssl_certfile` |
+| `RELAY_API_SSL_KEYFILE` | `api.ssl_keyfile` |
+| `RELAY_API_SSL_KEYFILE_PASSWORD` | `api.ssl_keyfile_password` |
+| `RELAY_API_SSL_CA_CERTS` | `api.ssl_ca_certs` |
+| `RELAY_API_SSL_CERT_REQS` | `api.ssl_cert_reqs` |
 | `RELAY_SMTP_HOST` | `smtp.host` |
 | `RELAY_SMTP_PORT` | `smtp.port` |
 | `RELAY_SMTP_SECURITY` | `smtp.security` |
@@ -126,7 +131,7 @@ Unknown keys and sections are rejected at startup, so a typo fails immediately
 rather than being ignored. Bad configuration exits with code 2 and a message naming
 the offending field.
 
-### TLS
+### SMTP TLS (outbound, to the mailhost)
 
 `smtp.security` accepts `starttls`, `tls`, or `none`. When omitted it is inferred
 from the port:
@@ -147,6 +152,45 @@ with `CERTIFICATE_VERIFY_FAILED` and nothing is delivered.
 
 `smtp.local_hostname` sets the name sent in `EHLO`/`HELO`; it defaults to the
 local FQDN.
+
+### API TLS (inbound, from clients)
+
+The two TLS concerns are independent: `smtp.*` protects the leg **to** your
+mailhost, `api.ssl_*` protects the leg **from** your clients.
+
+TLS on the API is **off by default**, and normally should stay off: `api.host`
+binds `127.0.0.1`, so requests never leave the machine and encryption buys
+nothing. Enable it only if remote clients will connect to this process directly
+rather than through a reverse proxy.
+
+Setting `api.ssl_certfile` switches the endpoint to HTTPS — plaintext HTTP is then
+refused on that port, not served alongside it.
+
+```toml
+[api]
+host = "0.0.0.0"
+ssl_certfile = "/etc/ssl/certs/smtp-relay.crt"
+ssl_keyfile = "/etc/ssl/private/smtp-relay.key"
+```
+
+| Key | Purpose |
+|---|---|
+| `api.ssl_certfile` | Server certificate chain. Its presence enables TLS. |
+| `api.ssl_keyfile` | Private key. Omit if the key is appended to the cert file. |
+| `api.ssl_keyfile_password` | Passphrase for an encrypted key. Prefer `RELAY_API_SSL_KEYFILE_PASSWORD`. |
+| `api.ssl_ca_certs` | Client CA bundle, for mutual TLS. |
+| `api.ssl_cert_reqs` | `none` \| `optional` \| `required` — mapped to `ssl.VerifyMode` for uvicorn. |
+
+Setting any `ssl_*` key other than `ssl_certfile` without `ssl_certfile` is a
+configuration error, caught at startup rather than inside uvicorn.
+
+uvicorn negotiates with its defaults (TLS 1.2+, `PROTOCOL_TLS_SERVER`); `ssl_version`
+and `ssl_ciphers` are deliberately not exposed. Mutual TLS is available via
+`ssl_ca_certs` + `ssl_cert_reqs = "required"`, which lets you authenticate clients
+by certificate instead of, or as well as, the bearer token.
+
+If you terminate TLS in a reverse proxy instead, leave `api.ssl_*` unset, keep
+`api.host = "127.0.0.1"`, and have the proxy forward to it.
 
 ### Recipient allowlist
 
@@ -188,10 +232,10 @@ encoding applied by every mail client, and is unrelated to the API-level rule ab
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest          # 106 tests
+.venv/bin/python -m pytest          # 119 tests
 ```
 
-Four layers:
+Five layers:
 
 - **unit** (`test_policy.py`, `test_config.py`, `test_logging_setup.py`) —
   allowlist matching, the base64 heuristic, TOML loading, env overrides, and the
@@ -201,13 +245,18 @@ Four layers:
 - **integration** (`test_integration.py`) — the whole stack against a real
   `aiosmtpd` server on an ephemeral port, asserting the message actually arrives
   with the right envelope and headers.
+- **API TLS** (`test_api_tls.py`) — the ssl config plumbing, plus a real uvicorn
+  server on an ephemeral port serving HTTPS with an openssl-minted certificate.
+  These skip cleanly where `openssl` is unavailable.
 - **packaging** (`test_windows_deployment.py`) — the service module compiles, and
   every platform-specific pin carries the marker that keeps `requirements.txt`
   installable on Windows.
 
-`test_relay.py` also contains `test_relay_calls_match_the_real_smtplib_signatures`,
-which binds every argument the relay passes against the *real* `smtplib` signatures.
-It exists because a fake SMTP object can only encode what we assume the library
+Two of these are *anti-mock* guards rather than behaviour tests.
+`test_relay_calls_match_the_real_smtplib_signatures` binds every argument the relay
+passes against the real `smtplib` signatures, and
+`test_ssl_kwargs_bind_to_the_real_uvicorn_config` does the same for the uvicorn TLS
+arguments. They exist because a fake object can only encode what we assume a library
 looks like; see History below.
 
 ## Deploying as a Windows service
@@ -273,7 +322,11 @@ Foreground runs (`python -m app`) still log to stderr.
 
 ### Operational notes
 
-- **Firewall** — the API port is not opened automatically:
+- **Firewall** — the API binds `127.0.0.1` by default, so it is reachable only
+  from the local machine and **no inbound rule is needed**. Only if you set
+  `api.host = "0.0.0.0"` do remote clients come into play, and you should enable
+  API TLS before opening the port, otherwise the bearer token crosses the network
+  in cleartext:
   ```powershell
   New-NetFirewallRule -DisplayName "SMTP Relay" -Direction Inbound `
     -LocalPort 8000 -Protocol TCP -Action Allow

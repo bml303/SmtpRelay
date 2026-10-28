@@ -100,6 +100,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
                 port=settings.api.port,
                 # Keep uvicorn from replacing the event log handler installed above.
                 log_config=None,
+                **settings.api.uvicorn_ssl_kwargs(),
             )
         )
         self._server = server
@@ -108,7 +109,8 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
         worker.start()
 
         log.info(
-            "Listening on %s:%s, relaying via %s (%s)",
+            "Listening on %s://%s:%s, relaying via %s (%s)",
+            settings.api.scheme,
             settings.api.host,
             settings.api.port,
             settings.smtp.endpoint,
@@ -116,7 +118,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
         )
         servicemanager.LogInfoMsg(
             f"{self._svc_display_name} listening on "
-            f"{settings.api.host}:{settings.api.port}, mailhost "
+            f"{settings.api.scheme}://{settings.api.host}:{settings.api.port}, mailhost "
             f"{settings.smtp.endpoint} ({settings.smtp.resolved_security})"
         )
 

@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import copy
 import os
+import ssl
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationError, model_validator
 
 SecurityMode = Literal["starttls", "tls", "none"]
 
@@ -55,6 +56,17 @@ class SmtpConfig(BaseModel):
         return f"{self.host}:{self.port}"
 
 
+#: uvicorn takes ``ssl_cert_reqs`` as an int (``ssl.VerifyMode``), not a string,
+#: so the readable config value is mapped before being passed on.
+SSL_VERIFY_MODES: dict[str, int] = {
+    "none": ssl.CERT_NONE,
+    "optional": ssl.CERT_OPTIONAL,
+    "required": ssl.CERT_REQUIRED,
+}
+
+SslVerifyMode = Literal["none", "optional", "required"]
+
+
 class ApiConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +75,60 @@ class ApiConfig(BaseModel):
     #: When set, every request must carry ``Authorization: Bearer <token>``.
     token: str | None = None
     max_recipients: int = Field(default=50, gt=0)
+
+    #: Inbound TLS. Off until ``ssl_certfile`` is set, at which point uvicorn
+    #: serves HTTPS. The default loopback bind means it is normally not needed.
+    ssl_certfile: Path | None = None
+    ssl_keyfile: Path | None = None
+    ssl_keyfile_password: str | None = None
+    #: Client CA bundle, for mutual TLS. Pair with ``ssl_cert_reqs``.
+    ssl_ca_certs: Path | None = None
+    ssl_cert_reqs: SslVerifyMode | None = None
+
+    @model_validator(mode="after")
+    def _require_certfile_for_tls(self) -> "ApiConfig":
+        """Reject a half-configured TLS setup at startup, not inside uvicorn."""
+        if self.ssl_certfile is not None:
+            return self
+        others = {
+            "ssl_keyfile": self.ssl_keyfile,
+            "ssl_keyfile_password": self.ssl_keyfile_password,
+            "ssl_ca_certs": self.ssl_ca_certs,
+            "ssl_cert_reqs": self.ssl_cert_reqs,
+        }
+        dangling = sorted(name for name, value in others.items() if value is not None)
+        if dangling:
+            raise ValueError(
+                "api.ssl_certfile is required when these are also set: " + ", ".join(dangling)
+            )
+        return self
+
+    @property
+    def tls_enabled(self) -> bool:
+        return self.ssl_certfile is not None
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.tls_enabled else "http"
+
+    def uvicorn_ssl_kwargs(self) -> dict[str, Any]:
+        """Keyword arguments for uvicorn; empty when TLS is off.
+
+        Shared by both entry points so the CLI and the Windows service cannot
+        drift apart in how they enable TLS.
+        """
+        if not self.tls_enabled:
+            return {}
+        kwargs: dict[str, Any] = {"ssl_certfile": str(self.ssl_certfile)}
+        if self.ssl_keyfile is not None:
+            kwargs["ssl_keyfile"] = str(self.ssl_keyfile)
+        if self.ssl_keyfile_password is not None:
+            kwargs["ssl_keyfile_password"] = self.ssl_keyfile_password
+        if self.ssl_ca_certs is not None:
+            kwargs["ssl_ca_certs"] = str(self.ssl_ca_certs)
+        if self.ssl_cert_reqs is not None:
+            kwargs["ssl_cert_reqs"] = SSL_VERIFY_MODES[self.ssl_cert_reqs]
+        return kwargs
 
 
 class PolicyConfig(BaseModel):
@@ -90,6 +156,11 @@ _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     "RELAY_API_PORT": ("api", "port"),
     "RELAY_API_TOKEN": ("api", "token"),
     "RELAY_MAX_RECIPIENTS": ("api", "max_recipients"),
+    "RELAY_API_SSL_CERTFILE": ("api", "ssl_certfile"),
+    "RELAY_API_SSL_KEYFILE": ("api", "ssl_keyfile"),
+    "RELAY_API_SSL_KEYFILE_PASSWORD": ("api", "ssl_keyfile_password"),
+    "RELAY_API_SSL_CA_CERTS": ("api", "ssl_ca_certs"),
+    "RELAY_API_SSL_CERT_REQS": ("api", "ssl_cert_reqs"),
     "RELAY_SMTP_HOST": ("smtp", "host"),
     "RELAY_SMTP_PORT": ("smtp", "port"),
     "RELAY_SMTP_SECURITY": ("smtp", "security"),
