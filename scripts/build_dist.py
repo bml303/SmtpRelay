@@ -118,9 +118,12 @@ def stage_source(payload: Path) -> None:
     for name in SOURCE_DIRS:
         src = PROJECT_ROOT / name
         dst = payload / name
+        # dirs_exist_ok: --keep-existing reuses a payload directory that already
+        # holds a staged copy, and copytree otherwise raises FileExistsError.
         shutil.copytree(
             src, dst,
             ignore=shutil.ignore_patterns("__pycache__", "*.py[cod]"),
+            dirs_exist_ok=True,
         )
 
     for script in sorted(INSTALLER_DIR.glob("*.ps1")):
@@ -155,10 +158,20 @@ def write_manifest(payload: Path, *, version: str, platform: str, python_version
 
 
 def make_zip(payload: Path) -> Path:
-    archive = payload.with_suffix(".zip")
+    """Archive the payload, preserving its full name.
+
+    Deliberately not ``payload.with_suffix(".zip")``: the directory name contains
+    dots (``SmtpRelay-0.1.0-win_amd64-cp315``), so pathlib treats
+    ``.0-win_amd64-cp315`` as the suffix and every payload for a given minor
+    version collapses onto one archive name. That would silently overwrite, say,
+    the win_arm64 build with the win_amd64 one - same filename, wrong wheels.
+    """
+    archive = payload.with_name(payload.name + ".zip")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(payload.rglob("*")):
             if path.is_file():
+                # Store relative to the parent so extracting recreates the
+                # named payload directory rather than spilling files loose.
                 zf.write(path, path.relative_to(payload.parent))
     print(f"  archive: {archive.name} ({archive.stat().st_size / 1e6:.1f} MB)")
     return archive

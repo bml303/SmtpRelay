@@ -7,7 +7,79 @@ the staging allowlist (which must never include the developer's config.toml).
 
 from __future__ import annotations
 
+import zipfile
+
 import build_dist
+
+
+def test_archive_name_preserves_platform_and_python_tag(tmp_path):
+    """Eight distinct payloads must produce eight distinct archive names.
+
+    ``Path("SmtpRelay-0.1.0-win_amd64-cp315").suffix`` is ``.0-win_amd64-cp315``,
+    so ``with_suffix(".zip")`` yields ``SmtpRelay-0.1.zip`` for *every* platform
+    and Python tag - silently overwriting one target's archive with another's, so
+    the wrong wheels get installed with no warning.
+    """
+    names = set()
+    for version in ("0.1.0", "0.2.0"):
+        for platform in ("win_amd64", "win_arm64"):
+            for tag in ("cp313", "cp315"):
+                payload = tmp_path / f"SmtpRelay-{version}-{platform}-{tag}"
+                payload.mkdir()
+                (payload / "marker.txt").write_text(f"{version} {platform} {tag}")
+                names.add(build_dist.make_zip(payload).name)
+
+    assert len(names) == 8, f"archive names collided: {sorted(names)}"
+    assert "SmtpRelay-0.1.0-win_amd64-cp315.zip" in names
+    assert "SmtpRelay-0.1.0-win_arm64-cp313.zip" in names
+
+
+def test_archive_extracts_into_a_named_directory(tmp_path):
+    """Entries must be prefixed, so extraction does not spill files loose."""
+    payload = tmp_path / "SmtpRelay-0.1.0-win_amd64-cp315"
+    (payload / "app").mkdir(parents=True)
+    (payload / "app" / "main.py").write_text("# code\n")
+    (payload / "install.ps1").write_text("# ps1\n")
+
+    archive = build_dist.make_zip(payload)
+
+    with zipfile.ZipFile(archive) as zf:
+        entries = zf.namelist()
+
+    prefix = "SmtpRelay-0.1.0-win_amd64-cp315/"
+    assert entries, "archive is empty"
+    assert all(entry.startswith(prefix) for entry in entries), entries
+    assert f"{prefix}app/main.py" in entries
+    assert f"{prefix}install.ps1" in entries
+
+
+def test_archive_round_trips_file_contents(tmp_path):
+    payload = tmp_path / "SmtpRelay-9.9.9-win_amd64-cp315"
+    payload.mkdir()
+    (payload / "MANIFEST.json").write_text('{"version": "9.9.9"}\n')
+
+    archive = build_dist.make_zip(payload)
+    extract_dir = tmp_path / "extracted"
+
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(extract_dir)
+
+    restored = extract_dir / payload.name / "MANIFEST.json"
+    assert restored.is_file()
+    assert restored.read_text() == '{"version": "9.9.9"}\n'
+
+
+def test_stage_source_is_idempotent(tmp_path):
+    """--keep-existing reuses a payload dir, so re-staging must not raise.
+
+    copytree without dirs_exist_ok=True fails with FileExistsError the second
+    time, which is exactly what a rebuild over an existing payload hits.
+    """
+    build_dist.stage_source(tmp_path)
+    build_dist.stage_source(tmp_path)
+
+    assert (tmp_path / "app" / "main.py").is_file()
+    assert (tmp_path / "install.ps1").is_file()
 
 
 def test_config_toml_is_never_staged():

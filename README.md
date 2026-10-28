@@ -275,7 +275,7 @@ encoding applied by every mail client, and is unrelated to the API-level rule ab
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest          # 153 tests
+.venv/bin/python -m pytest          # 157 tests
 ```
 
 Five layers:
