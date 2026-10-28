@@ -292,6 +292,35 @@ def test_installer_uses_the_bundled_runtime():
     assert script.count("& $Python -m pip install") >= 3
 
 
+def test_installer_grants_acls_by_sid_not_by_quoted_name():
+    """Regression guard for icacls exit 1332 (ERROR_NONE_MAPPED).
+
+    "NT SERVICE\\<name>" contains a space. Embedding literal quotes in a
+    native-command argument does not quote it: PowerShell already quotes
+    arguments containing spaces and escapes embedded quotes, so icacls receives
+    the quote characters as part of the account name and LookupAccountName fails.
+    Resolving the SID first yields "*S-1-5-80-...", which has no spaces.
+
+    Observed on a real Windows 11 ARM64 install.
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert '`"$ServiceAccount`"' not in script, "literal quotes wrapped the account name"
+    assert "SecurityIdentifier" in script, "the SID is not resolved before granting"
+    # ${identity} must be braced: "$identity:(OI)" parses `identity:` as a scope.
+    assert '"${identity}:(OI)(CI)RX"' in script
+    assert '"${identity}:(OI)(CI)R"' in script
+    assert '"$identity:' not in script
+
+
+def test_acl_failure_is_fatal_not_a_warning():
+    """Without these grants the service cannot read its runtime or config."""
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "$aclFailures" in script
+    assert "Stop-WithError" in script.split("$aclFailures.Count")[1][:400]
+
+
 def test_uninstaller_uses_the_bundled_runtime():
     script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
 

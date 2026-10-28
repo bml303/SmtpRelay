@@ -223,14 +223,39 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Ok "Service account: $ServiceAccount"
 
-# The SID contains a space, so icacls needs the identity quoted while the
-# permission bits stay outside the quotes.
-$grantInstall = "`"$ServiceAccount`":(OI)(CI)RX"
-$grantConfig  = "`"$ServiceAccount`":(OI)(CI)R"
+# Grant by SID, not by name. "NT SERVICE\<name>" contains a space, and embedding
+# literal quotes in a native-command argument does not work: PowerShell already
+# quotes arguments containing spaces and escapes embedded quotes, so icacls
+# receives the quotes as part of the identity and LookupAccountName fails with
+# 1332 ERROR_NONE_MAPPED. "*S-1-5-80-..." has no spaces and no ambiguity.
+$serviceSid = $null
+try {
+    $ntAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
+    $serviceSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+} catch {
+    $serviceSid = $null
+}
+
+if ($serviceSid) {
+    $identity = "*$serviceSid"
+    Write-Ok "$ServiceAccount -> $serviceSid"
+} else {
+    # Fall back to the name and let PowerShell do the quoting - do NOT add quotes.
+    $identity = $ServiceAccount
+    Write-Warn2 "Could not resolve a SID for '$ServiceAccount'; using the account name."
+}
+
+# The variable must be braced as ${identity}. Unbraced and followed by a colon it
+# parses as a scoped variable reference (drive-qualified name), which is empty
+# here, so the grant would silently apply to no identity at all.
+$grantInstall = "${identity}:(OI)(CI)RX"
+$grantConfig  = "${identity}:(OI)(CI)R"
+
+$aclFailures = @()
 
 & icacls.exe $InstallDir /grant $grantInstall | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Warn2 "Could not grant read+execute on '$InstallDir' (icacls exit $LASTEXITCODE)."
+    $aclFailures += "$InstallDir (icacls exit $LASTEXITCODE)"
 } else {
     Write-Ok "read+execute on $InstallDir"
 }
@@ -240,12 +265,22 @@ if ($LASTEXITCODE -ne 0) {
 & icacls.exe $ConfigDir /inheritance:r `
     /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' /grant $grantConfig | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Warn2 "Could not tighten ACLs on '$ConfigDir' (icacls exit $LASTEXITCODE)."
+    $aclFailures += "$ConfigDir (icacls exit $LASTEXITCODE)"
 } else {
     Write-Ok "$ConfigDir : SYSTEM+Administrators full, service read-only"
 }
 # Note the service gets no write access anywhere: it logs to the Event Log, so it
 # never needs to create a file.
+
+if ($aclFailures.Count -gt 0) {
+    # Fatal, not a warning: without these grants the service cannot read its own
+    # runtime or configuration, and would fail at start with an unrelated error.
+    Stop-WithError ("Could not set permissions on: " + ($aclFailures -join '; ') + ".") `
+        ("Run these elevated, then start the service:`n" +
+         "  icacls `"$InstallDir`" /grant `"NT SERVICE\$ServiceName:(OI)(CI)RX`"`n" +
+         "  icacls `"$ConfigDir`" /inheritance:r /grant `"SYSTEM:(OI)(CI)F`" " +
+         "/grant `"Administrators:(OI)(CI)F`" /grant `"NT SERVICE\$ServiceName:(OI)(CI)R`"")
+}
 
 # ------------------------------------------------------------------ firewall
 
