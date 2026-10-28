@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
 
-from app.config import ConfigError, load_config
+from app.config import (
+    POSIX_CONFIG_DIRNAME,
+    WINDOWS_CONFIG_DIRNAME,
+    ConfigError,
+    _candidate_paths,
+    _system_config_dir,
+    load_config,
+)
 
 MINIMAL = """
 [smtp]
@@ -160,6 +168,100 @@ def test_working_directory_wins_over_the_package_root(tmp_path, monkeypatch):
     monkeypatch.chdir(workdir)
 
     assert load_config().smtp.host == "workdir.example.com"
+
+
+def test_posix_system_config_dir_is_under_etc(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert _system_config_dir() == Path("/etc") / POSIX_CONFIG_DIRNAME
+
+
+def test_windows_system_config_dir_is_under_programdata(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("ProgramData", r"C:\ProgramData")
+
+    result = _system_config_dir()
+
+    # Compared by component: on this Linux host Path() cannot build a real
+    # WindowsPath, so asserting the whole string would test pathlib, not us.
+    assert result is not None
+    assert result.name == WINDOWS_CONFIG_DIRNAME == "SmtpRelay"
+    assert "ProgramData" in str(result.parent)
+
+
+def test_windows_without_programdata_degrades_gracefully(monkeypatch):
+    """A missing env var must not raise; the search just skips that candidate."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("ProgramData", raising=False)
+    monkeypatch.delenv("PROGRAMDATA", raising=False)
+
+    assert _system_config_dir() is None
+
+
+def test_search_order_is_cwd_then_system_then_package_root(tmp_path, monkeypatch):
+    workdir = tmp_path / "cwd"
+    install_root = tmp_path / "site-packages"
+    workdir.mkdir()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("ProgramData", str(tmp_path / "ProgramData"))
+    monkeypatch.setattr("app.config.PACKAGE_ROOT", install_root)
+    monkeypatch.chdir(workdir)
+
+    candidates, explicit = _candidate_paths(None)
+
+    assert explicit is False
+    assert candidates == [
+        workdir / "config.toml",
+        tmp_path / "ProgramData" / WINDOWS_CONFIG_DIRNAME / "config.toml",
+        install_root / "config.toml",
+    ]
+
+
+def test_config_is_found_in_the_system_dir(tmp_path, monkeypatch):
+    """The deployed-service case: CWD is System32-like, PACKAGE_ROOT is site-packages."""
+    system_dir = tmp_path / "ProgramData" / WINDOWS_CONFIG_DIRNAME
+    system_dir.mkdir(parents=True)
+    (system_dir / "config.toml").write_text(MINIMAL)
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("ProgramData", str(tmp_path / "ProgramData"))
+    monkeypatch.setattr("app.config.PACKAGE_ROOT", tmp_path / "site-packages")
+    monkeypatch.chdir(tmp_path)
+
+    assert load_config().smtp.host == "mail.example.com"
+
+
+def test_system_dir_wins_over_the_package_root(tmp_path, monkeypatch):
+    """ProgramData is the mutable config home; the install tree is read-only."""
+    system_dir = tmp_path / "ProgramData" / WINDOWS_CONFIG_DIRNAME
+    install_root = tmp_path / "site-packages"
+    system_dir.mkdir(parents=True)
+    install_root.mkdir()
+    (system_dir / "config.toml").write_text(MINIMAL)
+    (install_root / "config.toml").write_text(
+        MINIMAL.replace("mail.example.com", "installroot.example.com")
+    )
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("ProgramData", str(tmp_path / "ProgramData"))
+    monkeypatch.setattr("app.config.PACKAGE_ROOT", install_root)
+    monkeypatch.chdir(tmp_path)
+
+    assert load_config().smtp.host == "mail.example.com"
+
+
+def test_relay_config_overrides_the_system_dir(tmp_path, monkeypatch):
+    system_dir = tmp_path / "ProgramData" / WINDOWS_CONFIG_DIRNAME
+    system_dir.mkdir(parents=True)
+    (system_dir / "config.toml").write_text(MINIMAL)
+    explicit = tmp_path / "explicit.toml"
+    explicit.write_text(MINIMAL.replace("mail.example.com", "explicit.example.com"))
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("ProgramData", str(tmp_path / "ProgramData"))
+    monkeypatch.setenv("RELAY_CONFIG", str(explicit))
+
+    assert load_config().smtp.host == "explicit.example.com"
 
 
 def test_error_lists_every_searched_path(tmp_path, monkeypatch):

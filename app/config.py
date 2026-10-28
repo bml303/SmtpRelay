@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import os
 import ssl
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
@@ -22,6 +23,12 @@ DEFAULT_CONFIG_PATH = Path("config.toml")
 
 #: Directory holding the ``app`` package, i.e. the deployment/install root.
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
+#: Machine-wide config directory name, following each platform's convention.
+#: Windows uses the service name as registered with the SCM; POSIX uses the
+#: conventional lowercase-hyphenated form.
+WINDOWS_CONFIG_DIRNAME = "SmtpRelay"
+POSIX_CONFIG_DIRNAME = "smtp-relay"
 
 #: Security mode assumed per port when ``smtp.security`` is not set explicitly.
 PORT_DEFAULTS: dict[int, SecurityMode] = {465: "tls", 587: "starttls", 25: "none"}
@@ -232,20 +239,46 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _candidate_paths(explicit: str | os.PathLike[str] | None) -> tuple[list[Path], bool]:
-    """Return the config paths to try, and whether one was demanded explicitly.
+def _system_config_dir() -> Path | None:
+    """Machine-wide config directory, following each platform's convention.
 
-    Falls back to the deployment root (the directory holding the ``app`` package)
-    because the Windows SCM starts a service with its working directory set to
-    ``C:\\Windows\\System32``, where no ``config.toml`` will ever be found.
+    Windows: ``%ProgramData%\\SmtpRelay`` - Program Files is read-only by
+    convention and is wiped on upgrade, so mutable config does not belong there.
+    POSIX: ``/etc/smtp-relay``.
+    """
+    if sys.platform == "win32":
+        root = os.environ.get("ProgramData") or os.environ.get("PROGRAMDATA")
+        return Path(root) / WINDOWS_CONFIG_DIRNAME if root else None
+    return Path("/etc") / POSIX_CONFIG_DIRNAME
+
+
+def _candidate_paths(explicit: str | os.PathLike[str] | None) -> tuple[list[Path], bool]:
+    """Return the config paths to try, in priority order, and whether one was
+    demanded explicitly.
+
+    Three implicit locations, first match wins:
+
+    1. the working directory - convenient when iterating in a checkout
+    2. the machine-wide config dir - where a deployed service should read from.
+       Essential rather than cosmetic: the SCM starts a service with its working
+       directory set to ``C:\\Windows\\System32``, and under a non-editable
+       install ``PACKAGE_ROOT`` is ``site-packages``, which is wiped on upgrade.
+    3. beside the ``app`` package - correct for an editable checkout, where the
+       package lives in the repository
     """
     if explicit is not None:
         return [Path(explicit)], True
     from_env = os.environ.get(CONFIG_ENV_VAR)
     if from_env:
         return [Path(from_env)], True
+
     name = DEFAULT_CONFIG_PATH.name
-    return [Path.cwd() / name, PACKAGE_ROOT / name], False
+    candidates = [Path.cwd() / name]
+    system_dir = _system_config_dir()
+    if system_dir is not None:
+        candidates.append(system_dir / name)
+    candidates.append(PACKAGE_ROOT / name)
+    return candidates, False
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:

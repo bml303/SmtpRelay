@@ -275,7 +275,7 @@ encoding applied by every mail client, and is unrelated to the API-level rule ab
 ## Running the tests
 
 ```bash
-.venv/bin/python -m pytest          # 132 tests
+.venv/bin/python -m pytest          # 153 tests
 ```
 
 Five layers:
@@ -328,37 +328,135 @@ Windows:
 .venv\Scripts\pip install --no-deps -e .
 ```
 
+Before touching the service at all, the real smoke test is a plain foreground run,
+which involves no Service Control Manager at all:
+
+```powershell
+.venv\Scripts\python -m app
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
 Then, **from an elevated prompt**, using the venv's own interpreter (not the
 system Python):
 
 ```powershell
 .venv\Scripts\python -m app.windows_service install
+.venv\Scripts\python -m app.windows_service debug     # optional: run in a console
 .venv\Scripts\python -m app.windows_service start
 ```
 
-Other subcommands: `stop`, `restart`, `remove`, and `debug`. Run `debug` first —
-it executes in a console instead of under the Service Control Manager, and
-surfaces errors that the SCM would otherwise report only as "the service did not
-start".
+**`install` must come before `debug`.** pywin32 implements `debug` by locating the
+already-registered service's `pythonservice.exe` via `LocateSpecificServiceExe`, so
+running it against an unregistered service prints `The service does not appear to
+be installed.` and exits 1. That is pywin32's behaviour, not a fault in this code.
+
+`debug` is still worth running before `start`: it executes the same `SvcDoRun` in a
+console and logs to stderr, surfacing errors the SCM would otherwise report only as
+"the service did not start". Stop it with Ctrl+C.
+
+Other subcommands: `stop`, `restart`, `remove`.
 
 The service registers as `SmtpRelay`, displayed as "SMTP Relay".
 
+### Building an offline payload
+
+Instead of cloning and installing on the target, build a self-contained payload
+that installs with **no internet access and no C/C++ compiler**:
+
+```bash
+.venv/bin/python scripts/build_dist.py                       # win_amd64, cp3.15
+.venv/bin/python scripts/build_dist.py --python-version 3.13
+.venv/bin/python scripts/build_dist.py --platform win_arm64 --zip
+```
+
+This runs from any host OS, including Linux: wheels are fetched for the *target*
+platform via pip's cross-platform resolver. Because `--only-binary=:all:` is used,
+a package with no matching wheel fails the build **here** rather than demanding
+MSVC on the target. Markers are evaluated for a synthetic win32 environment first,
+since pip otherwise evaluates them against the build host and mis-resolves.
+
+The result is `dist/SmtpRelay-<version>-<platform>-<tag>/`:
+
+```
+app/                   application source
+wheels/                every dependency as a target-platform wheel
+install.ps1            offline installer (elevated)
+uninstall.ps1
+config.example.toml    template - the developer's config.toml is never staged
+pyproject.toml, requirements.txt, README.md
+MANIFEST.json          version, target, per-file sha256, payload digest
+```
+
+`dist/` is a build artifact and is gitignored. The staging list is an allowlist,
+so `config.toml` (which may hold a real SMTP password) cannot leak into a payload;
+`tests/test_build_dist.py` asserts that.
+
+Copy the directory to the target and, from an **elevated** prompt:
+
+```powershell
+cd C:\Temp\SmtpRelay-0.1.0-win_amd64-cp315
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Start
+```
+
+`install.ps1` locates a Python 3.11+ interpreter (override with
+`-PythonExecutable`), creates `.venv` under `C:\Program Files\SmtpRelay`, installs
+everything with `--no-index --find-links wheels`, seeds
+`C:\ProgramData\SmtpRelay\config.toml` from the template **without overwriting an
+existing one**, tightens that directory's ACLs to SYSTEM and Administrators,
+registers the service as automatic-start with restart-on-failure, and adds an
+Apps & features entry.
+
+Switches: `-InstallDir`, `-ConfigDir`, `-ServiceName`, `-PythonVersion`,
+`-PythonExecutable`, `-Start`, `-Force`.
+
+`uninstall.ps1` stops and removes the service, deletes the install directory and
+the Apps & features entry, and **preserves** `C:\ProgramData\SmtpRelay` unless you
+pass `-RemoveConfig`.
+
+The payload must match the target's Python minor version, because `pydantic-core`
+and `pywin32` ship version-specific wheels. `MANIFEST.json` records what it was
+built for and `install.ps1` warns on a mismatch.
+
 ### Configuration discovery
 
-A service's working directory is set by the SCM to `C:\Windows\System32`, so the
-config file is **not** looked for there alone. Search order:
+Two facts make this non-obvious for a service: the SCM starts it with the working
+directory set to `C:\Windows\System32`, and under a **non-editable** install the
+`app` package lives in `site-packages`, so "beside the package" is a directory that
+gets wiped on every upgrade.
+
+Search order, first match wins:
 
 1. an explicit path (internal use)
 2. `RELAY_CONFIG`, if set
 3. `config.toml` in the working directory
-4. `config.toml` beside the `app` package — the deployment root
+4. **`%ProgramData%\SmtpRelay\config.toml`** — the deployed location
+5. `config.toml` beside the `app` package
 
-Rule 4 is what makes a service work with no extra setup: keep `config.toml` next
-to the `app` directory you installed from. If you instead install into
-`site-packages`, set `RELAY_CONFIG` as a **machine-level** environment variable
-pointing at an absolute path, then restart the service. When nothing is found and
-the environment does not supply the required values, the startup error names every
-path that was searched.
+On Linux the equivalent of step 4 is `/etc/smtp-relay/config.toml`.
+
+**For a service install, put the file at `C:\ProgramData\SmtpRelay\config.toml`.**
+Not in `C:\Program Files`: that tree is read-only by convention, is replaced on
+upgrade, and is readable by all local users by default — which matters if the file
+holds an SMTP password or an API token. Step 5 exists for development against a
+checkout, where `app/` sits in the repository and `PACKAGE_ROOT` is the project
+root; it is not a deployment location.
+
+`ProgramData` subfolders also inherit read access for standard users, so harden the
+directory if the config carries credentials:
+
+```powershell
+icacls "C:\ProgramData\SmtpRelay" /inheritance:r `
+  /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+```
+
+The service runs as LocalSystem, so removing `Users` access does not affect it.
+Better still, keep secrets out of the file entirely and supply them as
+`RELAY_SMTP_PASSWORD` / `RELAY_API_TOKEN` — though note a system environment
+variable is also readable by local users, so for a genuinely hostile box prefer a
+gMSA or a secret manager.
+
+When nothing is found and the environment does not supply the required values, the
+startup error names **every** path that was searched.
 
 ### Logging
 
@@ -376,7 +474,13 @@ through the same handler rather than installing a competing one. Service start,
 stop, and configuration failures are also written via `servicemanager`, so they
 appear even if the logging layer itself failed to initialise.
 
-Foreground runs (`python -m app`) still log to stderr.
+Foreground runs (`python -m app`) and `debug` runs both log to stderr; only the
+real service under the SCM uses the Event Log. The service detects this with
+`self.ssh is None` — the status handle pywin32 registers in
+`ServiceFramework.__init__`, and the same signal its own `ReportServiceStatus`
+uses. It deliberately does not inspect `sys.argv`: the non-frozen debug path
+launches `pythonservice.exe -debug <name>`, so argv contains `-debug` rather than
+`debug` and an equality test silently misses.
 
 ### Operational notes
 
@@ -413,6 +517,11 @@ app/
   __main__.py         `python -m app` entry point
   windows_service.py  native Windows service (pywin32, Windows only)
 tests/
+scripts/
+  build_dist.py       cross-builds the offline Windows payload
+installer/
+  install.ps1         offline installer: venv, wheels, config, service
+  uninstall.ps1
 config.example.toml   annotated configuration template
 requirements.txt      fully pinned, cross-platform dependency set
 ```
@@ -439,3 +548,18 @@ bug instead of exposing it. It surfaced as an HTTP 500 on the first live request
 Both the call and the double were corrected, and the signature-binding test and the
 `aiosmtpd` integration tests were added so the same class of mistake fails in CI
 rather than in production.
+
+The second instance of the same class was pywin32. `python -m app.windows_service`
+executes the module as `__main__`, so `GetServiceClassString` falls back to
+recording a **filesystem path** as the service's `PythonClass`. `pythonservice.exe`
+then imports that file as a top-level module, this package's relative imports fail,
+and the process dies before `SvcRun` — so the SCM sees no status transition and
+reports only error 1053, "the service did not respond to the start or control
+request in a timely fashion". Nothing in the message points at an import error.
+Fixed by passing `serviceClassString=SERVICE_CLASS_STRING` explicitly, with a test
+that resolves the constant through `importlib.util.find_spec` so a bad path fails
+here rather than on a Windows host.
+
+Both were assumptions about a third-party API that no amount of Linux-side testing
+would have caught. The countermeasure in each case is the same: bind against the
+real library, or read its source, rather than modelling what it probably does.

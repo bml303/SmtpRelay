@@ -9,7 +9,9 @@ is actually wrong.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import py_compile
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -27,6 +29,45 @@ def test_service_module_compiles(tmp_path):
         cfile=str(tmp_path / "windows_service.pyc"),
         doraise=True,
     )
+
+
+def test_service_class_string_is_an_importable_dotted_path():
+    """Regression guard for SCM error 1053.
+
+    ``python -m app.windows_service`` makes ``__name__ == "__main__"``, so
+    pywin32's ``GetServiceClassString`` falls back to recording a *filesystem*
+    path in the registry. ``pythonservice.exe`` then imports that file as a
+    top-level module, the module's relative imports fail, and the process dies
+    before ``SvcRun`` - so the SCM sees no status transition and reports 1053.
+    """
+    src = SERVICE_MODULE.read_text()
+    match = re.search(r'^SERVICE_CLASS_STRING\s*=\s*["\']([^"\']+)["\']', src, re.M)
+    assert match, "SERVICE_CLASS_STRING is not defined in windows_service.py"
+
+    dotted = match.group(1)
+    assert "/" not in dotted and "\\" not in dotted, (
+        f"must be a dotted import path, not a filesystem path: {dotted}"
+    )
+
+    module_path, _, class_name = dotted.rpartition(".")
+    assert module_path and class_name, f"expected 'module.Class', got {dotted!r}"
+
+    # find_spec resolves the module without executing it, so this works even
+    # though importing it would raise off Windows.
+    assert importlib.util.find_spec(module_path) is not None, (
+        f"{module_path} is not importable - the SCM could not load the service"
+    )
+    assert re.search(rf"^class {re.escape(class_name)}\b", src, re.M), (
+        f"{class_name} is not defined in {module_path}"
+    )
+
+
+def test_handle_command_line_is_given_the_explicit_class_string():
+    """Defining the constant is not enough - it must actually be passed.
+
+    Omitting it silently reverts to pywin32's filesystem-path fallback.
+    """
+    assert "serviceClassString=SERVICE_CLASS_STRING" in SERVICE_MODULE.read_text()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows is the supported platform here")

@@ -48,6 +48,19 @@ from .main import create_app
 #: How long to let uvicorn drain connections after a stop request.
 SHUTDOWN_TIMEOUT_SECONDS = 30
 
+#: Registry ``PythonClass`` value: an importable dotted path, never a file path.
+#:
+#: This must be passed explicitly. Running ``python -m app.windows_service``
+#: executes the module as ``__main__``, so pywin32's ``GetServiceClassString``
+#: takes its fallback branch and records ``C:\...\app\windows_service.SmtpRelayService``
+#: - a filesystem path. ``pythonservice.exe`` then imports that file as a
+#: top-level module, the relative imports below (``from .config import ...``)
+#: raise ``ImportError: attempted relative import with no known parent package``,
+#: and the process dies before ``SvcRun``. The SCM never receives a status
+#: transition and reports error 1053, "The service did not respond to the start
+#: or control request in a timely fashion".
+SERVICE_CLASS_STRING = "app.windows_service.SmtpRelayService"
+
 log = logging.getLogger("smtp_relay")
 
 
@@ -79,10 +92,18 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
         win32event.SetEvent(self._stop_requested)
 
     def SvcDoRun(self) -> None:
-        # `debug` runs this same method in a console. Logging to the event log
-        # there would hide the very errors debug mode exists to reveal, so the
-        # console gets stderr and only the real service uses the event log.
-        if "debug" in sys.argv:
+        # `ssh` is the service status handle from RegisterServiceCtrlHandler,
+        # assigned in ServiceFramework.__init__ before SvcRun calls this. It is
+        # None exactly when running under `debug`, which is the same signal
+        # pywin32's own ReportServiceStatus uses (`if self.ssh is None:
+        # # Debugging!`).
+        #
+        # Do not detect debug mode from sys.argv: the non-frozen path runs
+        # `pythonservice.exe -debug <name>`, so argv holds "-debug" rather than
+        # "debug" and an equality test silently misses. Debug mode must log to
+        # the console - writing to the Event Log there would hide the very
+        # errors debug mode exists to reveal.
+        if self.ssh is None:
             configure_stderr_logging()
         else:
             configure_event_log_logging()
@@ -143,7 +164,9 @@ def main() -> None:
         servicemanager.PrepareToHostSingle(SmtpRelayService)
         servicemanager.StartServiceCtrlDispatcher()
     else:
-        win32serviceutil.HandleCommandLine(SmtpRelayService)
+        win32serviceutil.HandleCommandLine(
+            SmtpRelayService, serviceClassString=SERVICE_CLASS_STRING
+        )
 
 
 if __name__ == "__main__":
