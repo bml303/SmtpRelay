@@ -279,52 +279,87 @@ if (-not $serviceSid) {
     }
 }
 
-if ($serviceSid) {
-    # "*SID" form: no spaces, so no quoting ambiguity for a native command.
-    $identity = "*$serviceSid"
-    Write-Ok "$ServiceAccount -> $serviceSid"
-} else {
-    $identity = $ServiceAccount
-    Write-Warn2 "Could not resolve a SID for '$ServiceAccount'; falling back to the name."
-    Write-Warn2 "icacls will probably fail with 1332. Get the SID with:"
-    Write-Warn2 "  sc.exe showsid $ServiceName"
+if (-not $serviceSid) {
+    Stop-WithError "Could not resolve a SID for '$ServiceAccount'." `
+        "Get it manually with: sc.exe showsid $ServiceName"
+}
+Write-Ok "$ServiceAccount -> $serviceSid"
+
+# icacls CANNOT be used for a virtual service account. Even the documented
+# "*S-1-5-80-..." numeric form fails with 1332 ERROR_NONE_MAPPED, because icacls
+# performs its own SID->name lookup and a virtual service SID has no name in the
+# account database. Confirmed on Windows 11 ARM64 with SERVICE_SID_TYPE already
+# UNRESTRICTED, and with the "NT SERVICE\<name>" form too. Setting the SID type
+# makes the SID appear in the service token; it does not create a name for it.
+#
+# The .NET ACL API takes a SecurityIdentifier object directly and never calls
+# LookupAccountSid, so it is the only route that works here.
+try {
+    $sidObj = New-Object System.Security.Principal.SecurityIdentifier($serviceSid)
+} catch {
+    Stop-WithError "Could not build a SecurityIdentifier from '$serviceSid'." `
+        $_.Exception.Message
 }
 
-# The variable must be braced as ${identity}. Unbraced and followed by a colon it
-# parses as a scoped variable reference (drive-qualified name), which is empty
-# here, so the grant would silently apply to no identity at all.
-$grantInstall = "${identity}:(OI)(CI)RX"
-$grantConfig  = "${identity}:(OI)(CI)R"
+function New-AclRule {
+    param(
+        [System.Security.Principal.IdentityReference] $Identity,
+        [System.Security.AccessControl.FileSystemRights] $Rights
+    )
+    # ContainerInherit+ObjectInherit is the .NET equivalent of icacls "(OI)(CI)".
+    New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $Identity,
+        $Rights,
+        ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+         [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow)
+}
 
 $aclFailures = @()
 
-& icacls.exe $InstallDir /grant $grantInstall | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    $aclFailures += "$InstallDir (icacls exit $LASTEXITCODE)"
-} else {
+# InstallDir: additive grant only. Program Files' inherited defaults are left
+# intact - the service needs read+execute on the runtime and nothing more.
+try {
+    $acl = Get-Acl -Path $InstallDir
+    $acl.AddAccessRule((New-AclRule $sidObj 'ReadAndExecute'))
+    Set-Acl -Path $InstallDir -AclObject $acl
     Write-Ok "read+execute on $InstallDir"
+} catch {
+    $aclFailures += "$InstallDir ($($_.Exception.Message))"
 }
 
-# Strip inheritance on the config dir: it may hold an SMTP password or API token,
+# ConfigDir: strip inheritance, because it may hold an SMTP password or API token
 # and ProgramData subfolders otherwise inherit read access for standard users.
-& icacls.exe $ConfigDir /inheritance:r `
-    /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' /grant $grantConfig | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    $aclFailures += "$ConfigDir (icacls exit $LASTEXITCODE)"
-} else {
+# Then grant SYSTEM and Administrators full control and the service read-only.
+# Side effect: the interactive user loses access, so editing config.toml now
+# requires an elevated editor. That is the intended trade for protecting secrets.
+try {
+    $acl = Get-Acl -Path $ConfigDir
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($existing in @($acl.Access)) { $acl.RemoveAccessRule($existing) | Out-Null }
+    # Well-known SIDs, so no name resolution is involved here either.
+    $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $adminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $acl.AddAccessRule((New-AclRule $systemSid 'FullControl'))
+    $acl.AddAccessRule((New-AclRule $adminsSid 'FullControl'))
+    $acl.AddAccessRule((New-AclRule $sidObj 'Read'))
+    Set-Acl -Path $ConfigDir -AclObject $acl
     Write-Ok "$ConfigDir : SYSTEM+Administrators full, service read-only"
+} catch {
+    $aclFailures += "$ConfigDir ($($_.Exception.Message))"
 }
-# Note the service gets no write access anywhere: it logs to the Event Log, so it
+# The service gets no write access anywhere: it logs to the Event Log, so it
 # never needs to create a file.
 
 if ($aclFailures.Count -gt 0) {
     # Fatal, not a warning: without these grants the service cannot read its own
     # runtime or configuration, and would fail at start with an unrelated error.
     Stop-WithError ("Could not set permissions on: " + ($aclFailures -join '; ') + ".") `
-        ("Run these elevated, then start the service:`n" +
-         "  icacls `"$InstallDir`" /grant `"NT SERVICE\${ServiceName}:(OI)(CI)RX`"`n" +
-         "  icacls `"$ConfigDir`" /inheritance:r /grant `"SYSTEM:(OI)(CI)F`" " +
-         "/grant `"Administrators:(OI)(CI)F`" /grant `"NT SERVICE\${ServiceName}:(OI)(CI)R`"")
+        ("Do NOT retry with icacls - it cannot grant to a virtual service SID at all " +
+         "(1332 ERROR_NONE_MAPPED, even in *S-1-5-80-... form). Use Get-Acl/Set-Acl " +
+         "with a SecurityIdentifier built from the output of:`n" +
+         "  sc.exe showsid $ServiceName")
 }
 
 # ------------------------------------------------------------------ firewall

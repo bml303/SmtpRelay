@@ -363,25 +363,49 @@ def test_installer_uses_the_bundled_runtime():
     assert script.count("& $Python -m pip install") >= 3
 
 
-def test_installer_grants_acls_by_sid_not_by_quoted_name():
-    """Regression guard for icacls exit 1332 (ERROR_NONE_MAPPED).
+def test_installer_grants_acls_via_dotnet_not_icacls():
+    """icacls cannot grant to a virtual service SID, in any syntax.
 
-    "NT SERVICE\\<name>" contains a space. Embedding literal quotes in a
-    native-command argument does not quote it: PowerShell already quotes
-    arguments containing spaces and escapes embedded quotes, so icacls receives
-    the quote characters as part of the account name and LookupAccountName fails.
-    Resolving the SID first yields "*S-1-5-80-...", which has no spaces.
-
-    Observed on a real Windows 11 ARM64 install.
+    Even the documented ``*S-1-5-80-...`` numeric form fails with 1332
+    ERROR_NONE_MAPPED, because icacls performs its own SID->name lookup and a
+    virtual service SID has no name in the account database. Confirmed on a real
+    Windows 11 ARM64 host with SERVICE_SID_TYPE already UNRESTRICTED, and with the
+    ``NT SERVICE\\<name>`` form as well. The .NET ACL API takes a
+    SecurityIdentifier object and never calls LookupAccountSid.
     """
     script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
 
-    assert '`"$ServiceAccount`"' not in script, "literal quotes wrapped the account name"
-    assert "SecurityIdentifier" in script, "the SID is not resolved before granting"
-    # ${identity} must be braced: "$identity:(OI)" parses `identity:` as a scope.
-    assert '"${identity}:(OI)(CI)RX"' in script
-    assert '"${identity}:(OI)(CI)R"' in script
-    assert '"$identity:' not in script
+    assert not re.search(r"&\s+icacls\.exe", script), (
+        "icacls cannot resolve a virtual service SID; use Get-Acl/Set-Acl"
+    )
+    for required in (
+        "System.Security.Principal.SecurityIdentifier",
+        "System.Security.AccessControl.FileSystemAccessRule",
+        "AddAccessRule",
+        "Get-Acl",
+        "Set-Acl",
+    ):
+        assert required in script, f"missing {required}"
+
+    # Well-known SIDs for SYSTEM and Administrators, not localized names - the
+    # latter fail on non-English Windows.
+    assert "S-1-5-18" in script
+    assert "S-1-5-32-544" in script
+
+
+def test_config_dir_acls_protect_secrets_without_locking_out_admins():
+    """Stripping inheritance must be paired with explicit SYSTEM+Admins grants.
+
+    Otherwise Set-Acl can leave a directory nobody but the service can open -
+    including the administrator who has to edit config.toml.
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "SetAccessRuleProtection($true, $false)" in script
+    # The three grants must all be present and applied before Set-Acl.
+    for rights in ("'FullControl'", "'Read'", "'ReadAndExecute'"):
+        assert rights in script, f"missing grant {rights}"
+    assert script.index("SetAccessRuleProtection") < script.index("Set-Acl -Path $ConfigDir")
 
 
 def test_installer_resolves_service_sid_with_sc_showsid():
@@ -400,8 +424,9 @@ def test_installer_resolves_service_sid_with_sc_showsid():
     assert script.index("sc.exe showsid") < script.index("NTAccount"), (
         "NTAccount.Translate must be the fallback, not the primary path"
     )
-    # The SID must be granted in *SID form so no quoting ambiguity remains.
-    assert '$identity = "*$serviceSid"' in script
+    # The SID feeds a SecurityIdentifier object, not an icacls "*SID" string -
+    # icacls cannot resolve a virtual service SID in any form.
+    assert "SecurityIdentifier($serviceSid)" in script
 
 
 def test_installer_sets_service_sid_type_unrestricted():
@@ -419,7 +444,7 @@ def test_installer_sets_service_sid_type_unrestricted():
 
     assert "sc.exe sidtype $ServiceName unrestricted" in script
     # Must happen before any grant, and be read back rather than assumed.
-    assert script.index("sc.exe sidtype") < script.index("icacls.exe")
+    assert script.index("sc.exe sidtype") < script.index("SecurityIdentifier")
     assert "qsidtype" in script, "SERVICE_SID_TYPE is never verified after being set"
 
 
