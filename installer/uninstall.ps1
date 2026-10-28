@@ -1,17 +1,27 @@
 <#
 .SYNOPSIS
-    Removes the SMTP Relay Windows service and its installation.
+    Removes the SMTP Relay Windows service and every artifact it created.
 
 .DESCRIPTION
-    Stops and unregisters the service, removes the Add/Remove Programs entry and
-    deletes -InstallDir. Configuration under -ConfigDir is PRESERVED unless
-    -RemoveConfig is passed, so a reinstall keeps the existing settings.
+    Stops and unregisters the service, then removes:
+      - the Apps & features registry entry
+      - the Event Log source registration (deleting the service does NOT do this)
+      - the firewall rule created by install.ps1 -OpenFirewall
+      - -InstallDir, including the bundled CPython runtime
+      - -ConfigDir, only when -RemoveConfig is passed
+
+    Finishes by re-checking each location and reporting anything that survived,
+    so a clean-slate reinstall can be trusted rather than assumed.
 
     Run from an ELEVATED prompt.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
+    # Clean slate - remove everything, including configuration:
     powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -RemoveConfig
+
+.EXAMPLE
+    # Upgrade in place - keep C:\ProgramData\SmtpRelay\config.toml:
+    powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 #>
 #Requires -RunAsAdministrator
 [CmdletBinding()]
@@ -106,6 +116,57 @@ if ($RemoveConfig) {
     }
 } else {
     Write-Warn2 "Preserved $ConfigDir (pass -RemoveConfig to delete it)."
+}
+
+# ----------------------------------------------------------------- event log
+
+Write-Step "Removing Event Log source registration"
+# NTEventLogHandler registers this the first time the service runs. Deleting the
+# service does NOT remove it, so it otherwise survives every reinstall carrying
+# stale metadata.
+$eventLogKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\$ServiceName"
+if (Test-Path $eventLogKey) {
+    Remove-Item $eventLogKey -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $eventLogKey) { Write-Warn2 "Could not remove $eventLogKey" }
+    else { Write-Ok "Event Log source removed" }
+} else {
+    Write-Ok "No Event Log source registered"
+}
+
+# ------------------------------------------------------------------ firewall
+
+Write-Step "Removing firewall rule"
+$ruleName = "SMTP Relay ($ServiceName)"
+$rules = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+if ($rules) {
+    $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
+        Write-Warn2 "Could not remove rule '$ruleName'"
+    } else {
+        Write-Ok "Removed '$ruleName'"
+    }
+} else {
+    Write-Ok "No rule named '$ruleName'"
+}
+
+# -------------------------------------------------------------- verification
+
+Write-Step "Verifying nothing remains"
+$residue = @()
+if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) { $residue += "service '$ServiceName'" }
+if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName") { $residue += "SCM registry key" }
+if (Test-Path $eventLogKey) { $residue += "Event Log source" }
+if (Test-Path $uninstallKey) { $residue += "Apps & features entry" }
+if (Test-Path $InstallDir) { $residue += $InstallDir }
+if ($RemoveConfig -and (Test-Path $ConfigDir)) { $residue += $ConfigDir }
+if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) { $residue += "firewall rule" }
+
+if ($residue.Count -gt 0) {
+    Write-Warn2 ("Still present: " + ($residue -join '; '))
+    Write-Warn2 "A service marked for deletion keeps its SCM key until every handle"
+    Write-Warn2 "to it closes. If that is the only residue, reboot and re-check."
+} else {
+    Write-Ok "Clean - no residue detected"
 }
 
 Write-Host "`nUninstall complete." -ForegroundColor Green

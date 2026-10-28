@@ -9,6 +9,7 @@ installer uses the bundled runtime rather than discovering a system interpreter.
 
 from __future__ import annotations
 
+import re
 import zipfile
 
 import pytest
@@ -326,6 +327,44 @@ def test_uninstaller_uses_the_bundled_runtime():
 
     assert "python\\python.exe" in script
     assert ".venv" not in script
+
+
+def test_uninstaller_removes_every_artifact_the_installer_creates():
+    """A clean-slate reinstall must leave no residue behind.
+
+    Deleting a service does NOT remove its Event Log source registration, and
+    install.ps1 -OpenFirewall creates an inbound rule. Both would otherwise
+    survive every reinstall, so a subsequent run would not be a clean test.
+    """
+    script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+
+    assert "EventLog\\Application\\$ServiceName" in script, "Event Log source not removed"
+    assert "Remove-NetFirewallRule" in script, "firewall rule not removed"
+    assert "CurrentVersion\\Uninstall\\$ServiceName" in script, "Apps & features entry not removed"
+    assert "sc.exe delete" in script, "no fallback when the runtime is already gone"
+    # Must verify afterwards rather than assume each removal succeeded.
+    assert "Verifying nothing remains" in script
+
+
+def test_uninstaller_rule_name_matches_the_installer():
+    """A display-name mismatch would silently leave the firewall rule behind."""
+    install = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    uninstall = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+
+    created = re.search(r'New-NetFirewallRule\s+-DisplayName\s+"([^"]+)"', install)
+    removed = re.search(r'\$ruleName\s*=\s*"([^"]+)"', uninstall)
+
+    assert created, "install.ps1 creates no named firewall rule"
+    assert removed, "uninstall.ps1 does not name the rule it removes"
+    assert created.group(1) == removed.group(1), (created.group(1), removed.group(1))
+
+
+def test_uninstaller_offers_a_clean_slate_switch():
+    """Config is preserved by default, so removal must be explicitly available."""
+    script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+
+    assert "[switch] $RemoveConfig" in script
+    assert "-RemoveConfig" in script
 
 
 # --- dependency closure ----------------------------------------------------
