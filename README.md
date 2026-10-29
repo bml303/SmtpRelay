@@ -562,7 +562,7 @@ The tag is the source of truth. `vX.Y.Z` must match `version` in
 
 ```bash
 .venv/bin/python scripts/build_dist.py --version 0.3.0 --no-bump --platform win_arm64 --zip   # sets the version
-git commit -am "Release 0.3.0" && git tag -a v0.3.0 -m "..." && git push origin main v0.3.0
+git commit -am "Release 0.3.0" && git tag -a --cleanup=verbatim v0.3.0 -F notes.md && git push origin main v0.3.0
 ```
 
 `.gitea/workflows/release.yaml` then runs the tests, builds both Windows payloads
@@ -570,7 +570,8 @@ with the PowerShell syntax check enabled, writes `SHA256SUMS`, creates or update
 the release with the assets attached, and builds and pushes the multi-arch image
 as `gitea.softbase.tech/<owner>/smtp-relay:X.Y.Z` and `:latest`. Release notes
 are the annotated tag's message; a lightweight tag falls back to the commit
-subjects since the previous tag. Every step is idempotent, so re-running a failed
+subjects since the previous tag. Tag with `--cleanup=verbatim`, otherwise git
+strips every line starting with `#`, which is every Markdown heading. Every step is idempotent, so re-running a failed
 job converges rather than producing duplicate assets.
 
 Two runner requirements: a runner with the `ubuntu-latest` label must be
