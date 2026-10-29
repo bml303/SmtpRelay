@@ -177,3 +177,52 @@ def test_runtime_dependencies_contain_no_platform_specific_pins():
 
     for requirement in data["project"]["dependencies"]:
         assert ";" not in requirement, f"unexpected marker in runtime deps: {requirement}"
+
+
+def test_service_attribute_references_match_their_definitions():
+    """``SvcDoRun`` never runs on the Linux test host, so a typo such as
+    ``self._svc_display_name`` (no trailing underscore) for the pywin32
+    ``_svc_display_name_`` attribute only surfaces as an AttributeError on the
+    first start of the deployed service. Resolve every ``self.<attr>`` read in
+    the service class against what the class actually defines or assigns.
+    """
+    import ast
+
+    tree = ast.parse(SERVICE_MODULE.read_text())
+    service_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SmtpRelayService"
+    )
+
+    defined: set[str] = set()
+    referenced: set[str] = set()
+    for node in ast.walk(service_class):
+        if isinstance(node, ast.FunctionDef):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    defined.add(target.id)
+                elif isinstance(target, ast.Attribute) and _is_self(target.value):
+                    defined.add(target.attr)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                defined.add(node.target.id)
+            elif isinstance(node.target, ast.Attribute) and _is_self(node.target.value):
+                defined.add(node.target.attr)
+        elif isinstance(node, ast.Attribute) and _is_self(node.value):
+            referenced.add(node.attr)
+
+    # Inherited from pywin32's ServiceFramework; not visible in this file.
+    inherited = {"ssh", "ReportServiceStatus"}
+    unresolved = referenced - defined - inherited
+    assert not unresolved, (
+        f"self.<attr> used but never defined in SmtpRelayService: {sorted(unresolved)}"
+    )
+
+
+def _is_self(node) -> bool:
+    import ast
+
+    return isinstance(node, ast.Name) and node.id == "self"

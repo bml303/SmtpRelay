@@ -107,7 +107,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
             configure_stderr_logging()
         else:
             configure_event_log_logging()
-        servicemanager.LogInfoMsg(f"{self._svc_display_name} starting")
+        servicemanager.LogInfoMsg(f"{self._svc_display_name_} starting")
 
         try:
             settings = load_config()
@@ -116,7 +116,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
             # in the event log, which is where an operator will look.
             log.critical("Startup aborted, invalid configuration: %s", exc)
             servicemanager.LogErrorMsg(
-                f"{self._svc_display_name} configuration error: {exc}"
+                f"{self._svc_display_name_} configuration error: {exc}"
             )
             return
 
@@ -144,7 +144,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
             settings.smtp.resolved_security,
         )
         servicemanager.LogInfoMsg(
-            f"{self._svc_display_name} listening on "
+            f"{self._svc_display_name_} listening on "
             f"{settings.api.scheme}://{settings.api.host}:{settings.api.port}, mailhost "
             f"{settings.smtp.endpoint} ({settings.smtp.resolved_security})"
         )
@@ -154,7 +154,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
         if worker.is_alive():
             log.warning("HTTP server did not stop within %ss", SHUTDOWN_TIMEOUT_SECONDS)
 
-        servicemanager.LogInfoMsg(f"{self._svc_display_name} stopped")
+        servicemanager.LogInfoMsg(f"{self._svc_display_name_} stopped")
 
 
 def main() -> None:
