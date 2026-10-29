@@ -144,14 +144,16 @@ jobs:
       - name: Image SBOMs (syft, one per architecture)
         # The payload SBOMs come from build_dist.py, which knows every wheel it
         # bundled. The image additionally carries Debian packages from the base
-        # image, which only a scanner of the finished image can see.
+        # image, which only a scanner of the finished image can see. Pinned to
+        # CycloneDX 1.6 so all six documents of a release share one schema
+        # version (syft defaults to the newest it knows).
         run: |
           set -euo pipefail
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
           mkdir -p dist
           for arch in amd64 arm64; do
             syft "registry:${IMAGE}:v${VERSION}" --platform "linux/${arch}" \
-              -o "cyclonedx-json=dist/SmtpRelay-${VERSION}-image-${arch}.cdx.json"
+              -o "cyclonedx-json@1.6=dist/SmtpRelay-${VERSION}-image-${arch}.cdx.json"
           done
 
       - name: Attach image SBOMs to the release
