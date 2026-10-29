@@ -25,10 +25,9 @@ WORKDIR /src
 COPY pyproject.toml requirements.txt README.md ./
 COPY app ./app
 
-# requirements.txt is used as a *constraints* file: the runtime dependencies
-# stay pinned to the exact versions the test suite ran against, while the
-# test-only packages it also lists (pytest, httpx, aiosmtpd) are not pulled in.
-# Its Windows-only pins are skipped by their sys_platform markers.
+# requirements.txt is the pinned runtime set, used here as a *constraints* file
+# so the project's own metadata drives what is installed and the pins drive the
+# versions. Its Windows-only pywin32 pin is skipped by its sys_platform marker.
 RUN python -m venv /opt/smtp-relay \
  && /opt/smtp-relay/bin/pip install -c requirements.txt . \
  && /opt/smtp-relay/bin/pip check \

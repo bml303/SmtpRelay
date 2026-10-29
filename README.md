@@ -19,18 +19,24 @@ cp config.example.toml config.toml      # then edit host/port/sender/allowlist
 For a reproducible install from the pinned set instead of resolving fresh:
 
 ```bash
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pip install --no-deps -e .
 ```
 
-`requirements.txt` pins every transitive dependency to an exact version. It is a
-flat file, so it includes the test-only packages (`pytest`, `httpx`, `aiosmtpd`);
-use `pip install .` for a production install that skips them. Regenerate it after
-touching `pyproject.toml`:
+`requirements.txt` is the **runtime** set: every transitive dependency the
+service imports, pinned to an exact version, for all targets. It is what the
+payloads bundle and the image installs. `requirements-dev.txt` includes it and
+adds the test suite's packages (`pytest`, `httpx`, `aiosmtpd`, ...), which never
+ship. Regenerate the runtime set from a clean venv after touching
+`[project.dependencies]`, so nothing from the dev set leaks in:
 
 ```bash
-.venv/bin/python -m pip freeze --exclude-editable > requirements.txt
+python3 -m venv /tmp/rt && /tmp/rt/bin/pip install . && /tmp/rt/bin/pip freeze --exclude smtp-relay
 ```
+
+then restore the `pywin32; sys_platform == 'win32'` line, which a Linux freeze
+cannot emit. `scripts/build_dist.py` verifies the closure per target and refuses
+to build a payload with a missing transitive dependency.
 
 ### Dependencies
 
@@ -51,7 +57,8 @@ over its pure-Python `h11` protocol instead of `httptools`, which is irrelevant 
 mail-relay volumes (verified live with 200 KB and 2 MB request bodies).
 
 `tests/test_windows_deployment.py` fails if any of those six packages reappears in
-`requirements.txt`, or if `pyproject.toml` re-declares `uvicorn[standard]`.
+`requirements.txt`, if a test-only package does, or if `pyproject.toml`
+re-declares `uvicorn[standard]`.
 
 The API docs are served at <http://127.0.0.1:8000/docs>, the raw OpenAPI schema at
 `/openapi.json`, and a liveness probe at `/health`.
@@ -878,7 +885,8 @@ docker/
 Dockerfile            multi-arch (amd64/arm64) image, unprivileged, no secrets baked in
 compose.yaml          reference deployment behind a TLS-terminating proxy
 config.example.toml   annotated configuration template
-requirements.txt      fully pinned, cross-platform dependency set
+requirements.txt      fully pinned runtime dependency set, all targets (bundled)
+requirements-dev.txt  runtime set + test suite packages (never bundled)
 ```
 
 `create_app(config)` is an app factory rather than a module-level `app`, so tests can

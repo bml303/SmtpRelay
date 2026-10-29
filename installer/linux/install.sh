@@ -149,9 +149,9 @@ ok "$("$PY" -m pip --version | tail -n1)"
 # --root-user-action=ignore: pip warns about running as root, but a private
 # runtime under /opt owned by root is exactly the intended layout.
 PIP=("$PY" -m pip install --no-index --find-links "$WHEEL_DIR" --quiet --no-warn-script-location --root-user-action=ignore)
-"${PIP[@]}" setuptools wheel
-# requirements.txt carries sys_platform markers; pip evaluates them for this
-# host, so the Windows-only pins (pywin32, colorama) are skipped here.
+"${PIP[@]}" setuptools
+# requirements.txt is the runtime set only (no test packages). It carries a
+# sys_platform marker for pywin32, which pip evaluates for this host and skips.
 "${PIP[@]}" -r "$INSTALL_DIR/requirements.txt"
 ok "dependencies installed"
 

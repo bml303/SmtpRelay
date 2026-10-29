@@ -1,55 +1,34 @@
-# Pinned dependency set for smtp-relay.
+# Runtime dependency set for smtp-relay: exactly what the service imports,
+# pinned to exact versions, for every target (win_amd64, win_arm64,
+# linux_x86_64, linux_aarch64, the container image). This is what the payloads
+# bundle and what the installers install. Test-only packages live in
+# requirements-dev.txt, which includes this file.
 #
-# Every version is exact, so a fresh install reproduces this environment.
-# This file installs on Linux and Windows WITHOUT a C/C++ compiler: the only
-# compiled packages are pydantic-core and pywin32, and both have complete wheels
-# for win_amd64 and win_arm64 across cp311-cp315.
+# Installs WITHOUT a C/C++ compiler everywhere: the only compiled packages are
+# pydantic-core and pywin32, both with complete wheels for cp311-cp315. That
+# property depends on uvicorn being declared WITHOUT its [standard] extra
+# (httptools, PyYAML, watchfiles, websockets, python-dotenv, uvloop are neither
+# used nor wheel-complete on Windows); tests/test_windows_deployment.py guards it.
 #
-# That property depends on uvicorn being declared WITHOUT its [standard] extra.
-# The extra pulls in httptools, PyYAML, watchfiles, websockets, python-dotenv and
-# uvloop; PyYAML has no win_amd64 wheel for cp3.15 and no win_arm64 wheel for
-# cp3.11, which silently turns `pip install` into a source build requiring
-# Visual Studio Build Tools for C++. None of those six are used here.
-# tests/test_windows_deployment.py guards against reintroducing them.
-#
-# Regenerate after changing pyproject.toml:
-#   .venv/bin/python -m pip install -e '.[dev]'
-#   .venv/bin/python -m pip freeze --exclude-editable > requirements.txt
-#
-# WARNING: `pip freeze` runs on the current platform only. Regenerating on Linux
-# drops the Windows entry below, so after regenerating you must restore the
-# "platform-specific" block at the bottom of this file.
-#
-# Note: this is a single flat file, so it includes the test-only packages
-# (pytest, httpx, aiosmtpd). For a production install that skips them, use
-# `pip install .` (add `.[windows]` when deploying as a Windows service).
-#
-# The project itself is intentionally absent (--exclude-editable); install it
-# with `pip install .` or `pip install -e .` after these requirements.
+# Regenerate after changing [project.dependencies] in pyproject.toml, from a
+# clean venv so nothing from the dev set leaks in:
+#   python3 -m venv /tmp/rt && /tmp/rt/bin/pip install . && /tmp/rt/bin/pip freeze --exclude smtp-relay
+# then restore the platform-specific block at the bottom. scripts/build_dist.py
+# verifies the closure for the target platform and refuses to build if a
+# transitive dependency is missing.
 
-aiosmtpd==1.4.6
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
-atpublic==9.0.0
-attrs==26.1.0
-certifi==2026.10.23
 click==8.5.0
 dnspython==2.9.0
 email-validator==2.3.0
 fastapi==0.162.0
 h11==0.16.0
-httpcore==1.0.9
-httpx==0.28.1
 idna==3.20
-iniconfig==2.3.1
 opentelemetry-api==1.45.1
-packaging==26.3
-pluggy==1.7.0
 pydantic==2.14.1
 pydantic_core==2.50.1
-Pygments==2.21.0
-pytest==9.2.0
 starlette==1.10.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
@@ -57,11 +36,6 @@ uvicorn==0.54.0
 
 # --- platform-specific -------------------------------------------------
 # pywin32 is required only for the native Windows service (app/windows_service.py).
+# `pip freeze` on Linux never emits it, so it is maintained by hand and guarded
+# by tests/test_windows_deployment.py.
 pywin32==312; sys_platform == 'win32'
-
-# pytest requires colorama only on Windows. `pip freeze` on Linux omits it, and
-# pip evaluates markers against the HOST, so `pip download --platform win_arm64`
-# omits it too - the payload then fails to install offline with
-# "No matching distribution found for colorama>=0.4". build_dist.py verifies the
-# closure and refuses to build if this line is dropped.
-colorama==0.4.6; sys_platform == 'win32'

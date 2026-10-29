@@ -97,7 +97,7 @@ if (Test-Path $ManifestPath) {
 }
 
 $wheelCount = (Get-ChildItem $WheelDir -Filter '*.whl' -ErrorAction SilentlyContinue).Count
-if ($wheelCount -lt 20) {
+if ($wheelCount -lt 12) {
     Stop-WithError "Only $wheelCount wheels in '$WheelDir'; the bundle looks truncated."
 }
 Write-Ok "$wheelCount wheels available for offline install"
@@ -178,9 +178,9 @@ Write-Step "Installing build backend (offline)"
 # setuptools is needed to build the project's own wheel; pip's build isolation
 # would otherwise contact PyPI.
 Invoke-Checked "build backend install" {
-    & $Python -m pip install --no-index --find-links $WheelDir --quiet --no-warn-script-location setuptools wheel
+    & $Python -m pip install --no-index --find-links $WheelDir --quiet --no-warn-script-location setuptools
 }
-Write-Ok "setuptools + wheel"
+Write-Ok "setuptools"
 
 Write-Step "Installing dependencies from bundled wheels (offline)"
 Invoke-Checked "dependency install" {

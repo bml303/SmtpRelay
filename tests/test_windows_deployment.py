@@ -80,12 +80,12 @@ def test_importing_off_windows_fails_with_an_actionable_message():
     assert "pywin32" in message
 
 
-def _pinned_entries() -> dict[str, str]:
+def _pinned_entries(path: Path = PROJECT_ROOT / "requirements.txt") -> dict[str, str]:
     """Map normalized package name -> environment marker ("" when unmarked)."""
     entries: dict[str, str] = {}
-    for line in (PROJECT_ROOT / "requirements.txt").read_text().splitlines():
+    for line in path.read_text().splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or line.startswith("-r "):
             continue
         spec, _, marker = line.partition(";")
         name = spec.split("==")[0].strip().lower().replace("_", "-")
@@ -128,23 +128,46 @@ def test_pyproject_declares_plain_uvicorn():
         assert "[standard]" not in requirement, requirement
 
 
-#: Pins that exist only on Windows. `pip freeze` on Linux can never emit either,
-#: so both must be maintained by hand and are guarded here.
-WINDOWS_ONLY_PINS = {"pywin32", "colorama"}
+#: Pins that exist only on Windows. `pip freeze` on Linux can never emit them,
+#: so they are maintained by hand and guarded here. pywin32 is runtime (the
+#: native service); colorama is pytest's and belongs to the dev set only.
+WINDOWS_ONLY_RUNTIME_PINS = {"pywin32"}
+WINDOWS_ONLY_DEV_PINS = {"colorama"}
 
 
 def test_platform_specific_pins_are_exactly_the_windows_only_set():
-    """pywin32 is the native service dep; colorama is pytest's Windows-only
-    transitive dep, which pip's host-based marker evaluation hides on Linux.
-    """
     entries = _pinned_entries()
-
-    for name in WINDOWS_ONLY_PINS:
+    for name in WINDOWS_ONLY_RUNTIME_PINS:
         assert name in entries, f"{name} is missing from requirements.txt"
         assert "sys_platform == 'win32'" in entries[name], f"{name}: {entries[name]}"
 
-    marked = {name for name, marker in entries.items() if marker}
-    assert marked == WINDOWS_ONLY_PINS, f"unexpected platform-marked pins: {sorted(marked)}"
+    dev = _pinned_entries(PROJECT_ROOT / "requirements-dev.txt")
+    for name in WINDOWS_ONLY_DEV_PINS:
+        assert name in dev, f"{name} is missing from requirements-dev.txt"
+        assert "sys_platform == 'win32'" in dev[name]
+        assert name not in entries, f"{name} is test-only and must not ship in payloads"
+
+
+#: Packages that exist only for the test suite. Shipping them in a payload puts
+#: their CVEs on the service's SBOM for no benefit.
+TEST_ONLY = {"pytest", "httpx", "httpcore", "aiosmtpd", "pygments", "pluggy", "iniconfig", "atpublic"}
+
+
+def test_runtime_requirements_exclude_the_test_suite():
+    present = sorted(TEST_ONLY & set(_pinned_entries()))
+    assert not present, f"test-only packages in requirements.txt: {present}"
+
+
+def test_dev_requirements_include_the_runtime_set():
+    text = (PROJECT_ROOT / "requirements-dev.txt").read_text()
+    assert "-r requirements.txt" in text.splitlines()
+    dev = _pinned_entries(PROJECT_ROOT / "requirements-dev.txt")
+    assert "pytest" in dev and "aiosmtpd" in dev
+
+
+def test_no_unexpected_platform_marked_pins():
+    marked = {name for name, marker in _pinned_entries().items() if marker}
+    assert marked == WINDOWS_ONLY_RUNTIME_PINS, f"unexpected platform-marked pins: {sorted(marked)}"
 
 
 def test_only_well_wheeled_packages_remain_compiled():

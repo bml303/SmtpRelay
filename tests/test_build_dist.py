@@ -107,7 +107,9 @@ def test_build_backend_is_bundled_for_offline_install():
     joined = " ".join(build_dist.BUILD_BACKEND_PACKAGES).lower()
 
     assert "setuptools" in joined
-    assert "wheel" in joined
+    # Not the `wheel` package: setuptools >= 70.1 builds wheels itself, and
+    # wheel 0.48 would pull `packaging` into every payload for nothing.
+    assert "wheel" not in joined.split()
 
 
 def test_select_windows_requirements_swaps_platform_pins(tmp_path, monkeypatch):
@@ -682,12 +684,12 @@ def test_closure_normalizes_underscores_and_case(tmp_path):
     assert closure(tmp_path) == {}
 
 
-def test_requirements_pin_the_windows_only_transitive_dep():
+def test_requirements_pin_the_windows_only_runtime_dep():
     """`pip freeze` on Linux can never emit this line, so guard it explicitly."""
     text = (build_dist.PROJECT_ROOT / "requirements.txt").read_text()
-    lines = [ln for ln in text.splitlines() if ln.strip().lower().startswith("colorama")]
+    lines = [ln for ln in text.splitlines() if ln.strip().lower().startswith("pywin32")]
 
-    assert lines, "colorama is missing from requirements.txt"
+    assert lines, "pywin32 is missing from requirements.txt"
     assert "sys_platform == 'win32'" in lines[0]
 
 
