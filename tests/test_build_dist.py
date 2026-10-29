@@ -717,3 +717,74 @@ def test_installer_suppresses_pip_script_location_warnings():
     assert installs
     for line in installs:
         assert "--no-warn-script-location" in line, line
+
+
+# --- SBOM ---------------------------------------------------------------------
+
+
+def _sbom_for(tmp_path, platform="linux_x86_64"):
+    import json as _json
+    payload = tmp_path / f"SmtpRelay-0.3.1-{platform}-cp315"
+    wheels = payload / "wheels"
+    wheels.mkdir(parents=True)
+    make_wheel(wheels, "fastapi", "0.162.0", requires=["starlette>=0.40", "pydantic>=2"])
+    make_wheel(wheels, "starlette", "1.10.0")
+    make_wheel(wheels, "pydantic", "2.14.1", requires=[
+        "pydantic_core==2.50.1", 'email-validator>=2.0; extra == "email"'])
+    make_wheel(wheels, "pydantic_core", "2.50.1")
+    make_wheel(wheels, "email_validator", "2.3.0")
+    make_wheel(wheels, "uvicorn", "0.54.0")
+    make_wheel(wheels, "pywin32", "312")  # present only to prove it is listed when bundled
+    runtime = build_dist.RuntimeInfo(10, "python-build-standalone:20261026", "https://example.org/cpython.tar.gz", "ab" * 32)
+    out = build_dist.write_sbom(
+        payload, version="0.3.1", platform=platform, runtime_version="3.15.2",
+        runtime=runtime, git_commit="deadbeef",
+    )
+    return payload, _json.loads(out.read_text())
+
+
+def test_sbom_is_cyclonedx_with_one_component_per_wheel_plus_runtime(tmp_path):
+    payload, bom = _sbom_for(tmp_path)
+
+    assert bom["bomFormat"] == "CycloneDX" and bom["specVersion"] == "1.6"
+    assert bom["metadata"]["component"]["purl"] == "pkg:pypi/smtp-relay@0.3.1"
+    props = {p["name"]: p["value"] for p in bom["metadata"]["component"]["properties"]}
+    assert props["smtprelay:target"] == "linux_x86_64" and props["smtprelay:git_commit"] == "deadbeef"
+
+    by_name = {c["name"]: c for c in bom["components"]}
+    assert set(by_name) == {"fastapi", "starlette", "pydantic", "pydantic-core", "email-validator", "uvicorn", "pywin32", "cpython"}
+    assert by_name["cpython"]["type"] == "platform"
+    assert by_name["cpython"]["hashes"][0]["content"] == "ab" * 32
+    assert (payload / build_dist.SBOM_FILENAME).is_file()
+
+
+def test_sbom_hashes_match_the_wheel_files(tmp_path):
+    import hashlib as _h
+    payload, bom = _sbom_for(tmp_path)
+    for component in bom["components"]:
+        if component["type"] != "library":
+            continue
+        wheel = payload / "wheels" / next(p["value"] for p in component["properties"] if p["name"] == "smtprelay:wheel")
+        assert component["hashes"][0]["content"] == _h.sha256(wheel.read_bytes()).hexdigest()
+        assert component["purl"].startswith(f"pkg:pypi/{component['name']}@{component['version']}?file_name=")
+
+
+def test_sbom_dependency_graph_follows_requires_dist_and_requested_extras(tmp_path):
+    _, bom = _sbom_for(tmp_path)
+    deps = {d["ref"]: d["dependsOn"] for d in bom["dependencies"]}
+    ref = lambda name: next(c["bom-ref"] for c in bom["components"] if c["name"] == name)
+
+    # The application depends on its declared direct dependencies and the runtime.
+    app = deps["pkg:pypi/smtp-relay@0.3.1"]
+    assert ref("fastapi") in app and ref("uvicorn") in app and ref("pydantic") in app and ref("cpython") in app
+    assert set(deps[ref("fastapi")]) == {ref("starlette"), ref("pydantic")}
+    # pydantic[email] is requested in pyproject, so the extra's dependency is live.
+    assert set(deps[ref("pydantic")]) == {ref("pydantic-core"), ref("email-validator")}
+    assert deps[ref("cpython")] == []
+
+
+def test_sbom_license_extraction_prefers_pep639_then_classifier():
+    assert build_dist._license_of("License-Expression: MIT\nClassifier: License :: OSI Approved :: BSD License\n") == {"expression": "MIT"}
+    assert build_dist._license_of("Classifier: License :: OSI Approved :: Apache Software License\n") == {"license": {"name": "Apache Software License"}}
+    assert build_dist._license_of("License: UNKNOWN\n") is None
+    assert build_dist._license_of("License: PSF-2.0\n") == {"license": {"name": "PSF-2.0"}}

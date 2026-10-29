@@ -30,7 +30,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,6 +78,16 @@ TARGETS: dict[str, Target] = {
         "tar.gz",
     ),
 }
+
+@dataclass(frozen=True)
+class RuntimeInfo:
+    """What was bundled, for MANIFEST.json and the SBOM."""
+
+    files: int
+    source: str   #: "nuget:<pkg>" or "python-build-standalone:<release tag>"
+    url: str
+    sha256: str
+
 
 #: nuget package id per Windows platform tag. There is no 32-bit package.
 NUGET_RUNTIME_PACKAGES = {
@@ -357,10 +369,10 @@ def wheel_tag_for(runtime_version: str) -> str:
     return f"{parts[0]}.{parts[1]}"
 
 
-def fetch_python_runtime(platform: str, runtime_version: str, dest: Path) -> tuple[int, str]:
-    """Fetch the target's CPython into ``dest``. Returns (file count, source label)."""
+def fetch_python_runtime(platform: str, runtime_version: str, dest: Path) -> RuntimeInfo:
+    """Fetch the target's CPython into ``dest``."""
     if target_for(platform).family == "windows":
-        return _fetch_nuget_runtime(platform, runtime_version, dest), f"nuget:{runtime_package_for(platform)}"
+        return _fetch_nuget_runtime(platform, runtime_version, dest)
     return _fetch_pbs_runtime(platform, runtime_version, dest)
 
 
@@ -372,7 +384,7 @@ def _latest_pbs_release() -> str:
         return json.load(response)["tag_name"]
 
 
-def _fetch_pbs_runtime(platform: str, runtime_version: str, dest: Path) -> tuple[int, str]:
+def _fetch_pbs_runtime(platform: str, runtime_version: str, dest: Path) -> RuntimeInfo:
     """Download a python-build-standalone ``install_only_stripped`` tarball,
     verify it against the release's SHA256SUMS, and extract it into ``dest``.
 
@@ -426,10 +438,10 @@ def _fetch_pbs_runtime(platform: str, runtime_version: str, dest: Path) -> tuple
     if not list(dest.glob("lib/python3.*/ensurepip")):
         raise SystemExit("bundled runtime has no ensurepip; offline pip bootstrap would fail")
     print(f"  runtime: {extracted} files -> {dest.name}/")
-    return extracted, f"python-build-standalone:{tag}"
+    return RuntimeInfo(extracted, f"python-build-standalone:{tag}", PBS_DOWNLOAD.format(tag=tag, name=name), expected)
 
 
-def _fetch_nuget_runtime(platform: str, runtime_version: str, dest: Path) -> int:
+def _fetch_nuget_runtime(platform: str, runtime_version: str, dest: Path) -> RuntimeInfo:
     """Download the nuget CPython package and extract its ``tools/`` into ``dest``.
 
     The nuget package is a full CPython layout: loose ``Lib/``, ``ensurepip`` with
@@ -448,6 +460,7 @@ def _fetch_nuget_runtime(platform: str, runtime_version: str, dest: Path) -> int
     with tempfile.TemporaryDirectory() as tmp:
         nupkg = Path(tmp) / "runtime.nupkg"
         urllib.request.urlretrieve(url, nupkg)
+        nupkg_sha256 = hashlib.sha256(nupkg.read_bytes()).hexdigest()
 
         extracted = 0
         with zipfile.ZipFile(nupkg) as zf:
@@ -473,7 +486,7 @@ def _fetch_nuget_runtime(platform: str, runtime_version: str, dest: Path) -> int
         raise SystemExit("bundled runtime has a ._pth file, which would disable site and break pywin32")
 
     print(f"  runtime: {extracted} files -> {dest.name}/")
-    return extracted
+    return RuntimeInfo(extracted, f"nuget:{pkg}", url, nupkg_sha256)
 
 
 def select_requirements(platform: str, python_version: str, dest: Path) -> Path:
@@ -622,6 +635,184 @@ def stage_source(payload: Path, platform: str = "win_arm64") -> None:
     print(f"  staged: {', '.join(SOURCE_DIRS + SOURCE_FILES)} + {len(files)} installer file(s)")
 
 
+# --- SBOM ----------------------------------------------------------------------
+
+SBOM_FILENAME = "SBOM.cdx.json"
+
+
+def _normalize(name: str) -> str:
+    from packaging.utils import canonicalize_name
+    return canonicalize_name(name)
+
+
+def _wheel_metadata(wheel: Path) -> str:
+    with zipfile.ZipFile(wheel) as zf:
+        metas = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+        return zf.read(metas[0]).decode("utf-8", "replace") if metas else ""
+
+
+def _license_of(metadata: str) -> dict | None:
+    """CycloneDX license entry from wheel METADATA, best source first:
+    PEP 639 License-Expression, then an OSI classifier, then the License field."""
+    match = re.search(r"^License-Expression:\s*(.+)$", metadata, re.M)
+    if match:
+        return {"expression": match.group(1).strip()}
+    classifiers = re.findall(r"^Classifier:\s*License :: (?:OSI Approved :: )?(.+)$", metadata, re.M)
+    if classifiers:
+        return {"license": {"name": classifiers[0].strip()}}
+    match = re.search(r"^License:\s*(.+)$", metadata, re.M)
+    if match and match.group(1).strip().upper() not in {"UNKNOWN", ""} and len(match.group(1)) < 80:
+        return {"license": {"name": match.group(1).strip()}}
+    return None
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def _project_requirements() -> list:
+    from packaging.requirements import Requirement
+    data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+    return [Requirement(r) for r in data["project"]["dependencies"]]
+
+
+def write_sbom(
+    payload: Path,
+    *,
+    version: str,
+    platform: str,
+    runtime_version: str,
+    runtime: RuntimeInfo,
+    wheel_dir: Path | None = None,
+    git_commit: str | None = None,
+) -> Path:
+    """Write a CycloneDX 1.6 SBOM for exactly this payload.
+
+    One document per artefact, because the sets differ: pywin32 only on Windows,
+    a per-architecture pydantic-core wheel, a different runtime source per
+    family. Components are the application, every bundled wheel (with the
+    wheel file's sha256, its license and a purl naming the exact file) and the
+    bundled CPython (with the archive's sha256 and download URL). The dependency
+    graph comes from each wheel's Requires-Dist, with markers evaluated for the
+    *target* exactly as verify_dependency_closure does.
+    """
+    from packaging.requirements import Requirement
+
+    env_base = marker_environment(platform, runtime_version)
+    wheels = sorted((wheel_dir or payload / "wheels").glob("*.whl"))
+
+    components: list[dict] = []
+    refs: dict[str, str] = {}
+    requires: dict[str, list[str]] = {}
+    for wheel in wheels:
+        raw_name, wheel_version = wheel.name.split("-")[:2]
+        name = _normalize(raw_name)
+        metadata = _wheel_metadata(wheel)
+        purl = f"pkg:pypi/{name}@{wheel_version}?file_name={urllib.parse.quote(wheel.name)}"
+        component = {
+            "type": "library",
+            "bom-ref": purl,
+            "name": name,
+            "version": wheel_version,
+            "purl": purl,
+            "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(wheel.read_bytes()).hexdigest()}],
+            "properties": [{"name": "smtprelay:wheel", "value": wheel.name}],
+        }
+        license_entry = _license_of(metadata)
+        if license_entry:
+            component["licenses"] = [license_entry]
+        components.append(component)
+        refs[name] = purl
+        requires[name] = re.findall(r"^Requires-Dist:\s*(.+)$", metadata, re.M)
+
+    runtime_ref = f"pkg:generic/cpython@{runtime_version}?download_url={urllib.parse.quote(runtime.url, safe='')}"
+    components.append({
+        "type": "platform",
+        "bom-ref": runtime_ref,
+        "name": "cpython",
+        "version": runtime_version,
+        "purl": runtime_ref,
+        "hashes": [{"alg": "SHA-256", "content": runtime.sha256}],
+        "licenses": [{"expression": "PSF-2.0"}],
+        "externalReferences": [{"type": "distribution", "url": runtime.url}],
+        "properties": [{"name": "smtprelay:runtime_source", "value": runtime.source}],
+    })
+
+    # Extras the project requests on its direct dependencies (pydantic[email]).
+    project_reqs = _project_requirements()
+    requested_extras: dict[str, set[str]] = {_normalize(r.name): set(r.extras) for r in project_reqs}
+
+    def resolved_deps(package: str) -> list[str]:
+        deps: list[str] = []
+        active = requested_extras.get(package, set())
+        for line in requires.get(package, []):
+            try:
+                req = Requirement(line)
+            except Exception:
+                continue
+            if req.marker is not None:
+                if not any(_marker_true(req.marker, env_base, extra) for extra in active | {""}):
+                    continue
+            dep = _normalize(req.name)
+            if dep in refs and refs[dep] not in deps:
+                deps.append(refs[dep])
+        return deps
+
+    app_ref = f"pkg:pypi/smtp-relay@{version}"
+    dependencies = [{
+        "ref": app_ref,
+        "dependsOn": [refs[_normalize(r.name)] for r in project_reqs if _normalize(r.name) in refs] + [runtime_ref],
+    }]
+    for name in sorted(refs):
+        dependencies.append({"ref": refs[name], "dependsOn": resolved_deps(name)})
+    dependencies.append({"ref": runtime_ref, "dependsOn": []})
+
+    commit = _git_commit() if git_commit is None else git_commit
+    bom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+        "version": 1,
+        "metadata": {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tools": {"components": [{"type": "application", "name": "smtp-relay build_dist.py", "version": version}]},
+            "component": {
+                "type": "application",
+                "bom-ref": app_ref,
+                "name": "smtp-relay",
+                "version": version,
+                "purl": app_ref,
+                "properties": [
+                    {"name": "smtprelay:target", "value": platform},
+                    {"name": "smtprelay:family", "value": target_for(platform).family},
+                    {"name": "smtprelay:runtime_version", "value": runtime_version},
+                    {"name": "smtprelay:git_commit", "value": commit},
+                ],
+            },
+        },
+        "components": components,
+        "dependencies": dependencies,
+    }
+    out = payload / SBOM_FILENAME
+    out.write_text(json.dumps(bom, indent=2) + "\n")
+    print(f"  sbom: {len(components)} components -> {out.name}")
+    return out
+
+
+def _marker_true(marker, env_base: dict, extra: str) -> bool:
+    env = dict(env_base)
+    env["extra"] = extra
+    try:
+        return bool(marker.evaluate(env))
+    except Exception:
+        return False
+
+
 def write_manifest(
     payload: Path,
     *,
@@ -630,6 +821,7 @@ def write_manifest(
     runtime_version: str,
     runtime_files: int,
     runtime_source: str = "",
+    runtime_sha256: str = "",
     wheel_count: int,
 ) -> None:
     digest = hashlib.sha256()
@@ -649,6 +841,7 @@ def write_manifest(
         "runtime_version": runtime_version,
         "runtime_files": runtime_files,
         "runtime_source": runtime_source,
+        "runtime_sha256": runtime_sha256,
         "wheel_tag": f"cp{runtime_version.split('.')[0]}{runtime_version.split('.')[1]}",
         "wheel_count": wheel_count,
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -761,9 +954,7 @@ def main() -> int:
             shutil.rmtree(payload)
     payload.mkdir(parents=True, exist_ok=True)
 
-    runtime_files, runtime_source = fetch_python_runtime(
-        args.platform, args.runtime_version, payload / RUNTIME_DIRNAME
-    )
+    runtime = fetch_python_runtime(args.platform, args.runtime_version, payload / RUNTIME_DIRNAME)
 
     with tempfile.TemporaryDirectory() as tmp:
         requirements = select_requirements(args.platform, python_version, Path(tmp) / f"requirements-{args.platform}.txt")
@@ -794,15 +985,22 @@ def main() -> int:
         # pyproject.toml, app.__version__ (served at /health), MANIFEST.json and
         # directory name must all agree. Done before the manifest hashes anything.
         write_version(version, payload)
+    sbom = write_sbom(
+        payload, version=version, platform=args.platform,
+        runtime_version=args.runtime_version, runtime=runtime,
+    )
     write_manifest(
         payload,
         version=version,
         platform=args.platform,
         runtime_version=args.runtime_version,
-        runtime_files=runtime_files,
-        runtime_source=runtime_source,
+        runtime_files=runtime.files,
+        runtime_source=runtime.source,
+        runtime_sha256=runtime.sha256,
         wheel_count=wheel_count,
     )
+    # A copy beside the archive, so scanners never have to download the payload.
+    shutil.copy2(sbom, DIST_ROOT / f"{payload.name}.cdx.json")
     if args.zip:
         make_archive(payload, args.platform)
 
