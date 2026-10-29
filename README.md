@@ -717,6 +717,11 @@ Three gotchas, all learned on a real Windows 11 ARM64 host:
   **after** service registration. `SeServiceLogonRight` is held by
   `NT SERVICE\ALL SERVICES` in the default policy; only a *named* account needs
   it granted explicitly.
+- With `SERVICE_SID_TYPE` unrestricted the service SID is in the process token
+  **whatever account the service runs as**. Switching the service to
+  NetworkService for a test therefore still reads `config.toml` through the
+  grant to `NT SERVICE\SmtpRelay`; that is by design, not a hole in the ACL, and
+  such a test says nothing about the ACL.
 
 ### Operational notes
 
