@@ -121,9 +121,9 @@ if ($RemoveConfig) {
 # ----------------------------------------------------------------- event log
 
 Write-Step "Removing Event Log source registration"
-# NTEventLogHandler registers this the first time the service runs. Deleting the
-# service does NOT remove it, so it otherwise survives every reinstall carrying
-# stale metadata.
+# install.ps1 registers this (the virtual service account cannot). Deleting the
+# service does NOT remove it, so it would otherwise survive every reinstall
+# carrying stale message-file paths.
 $eventLogKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\$ServiceName"
 if (Test-Path $eventLogKey) {
     Remove-Item $eventLogKey -Recurse -Force -ErrorAction SilentlyContinue

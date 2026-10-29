@@ -626,3 +626,29 @@ def test_requirements_pin_the_windows_only_transitive_dep():
 
     assert lines, "colorama is missing from requirements.txt"
     assert "sys_platform == 'win32'" in lines[0]
+
+
+def test_installer_registers_the_event_log_source_with_both_message_files():
+    """The virtual service account cannot register the source itself.
+
+    NTEventLogHandler ignores the access-denied on first use, so without the
+    installer doing it every record renders as "The description for Event ID
+    ... cannot be found". Two writers, two message tables: win32service.pyd for
+    the app's ID-1 records and servicemanager.pyd for pywin32's own messages.
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "EventLog\\Application\\$ServiceName" in script
+    assert "'win32service.pyd', 'servicemanager.pyd'" in script
+    assert "EventMessageFile" in script and "TypesSupported" in script
+    # uninstall must remove what install registers.
+    assert "EventLog\\Application\\$ServiceName" in (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+
+
+def test_installer_suppresses_pip_script_location_warnings():
+    """Scripts\\ in the private runtime is never on PATH; the advice is noise."""
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    installs = [l for l in script.splitlines() if "pip" in l and " install " in l and not l.lstrip().startswith("#")]
+    assert installs
+    for line in installs:
+        assert "--no-warn-script-location" in line, line

@@ -651,8 +651,13 @@ The service logs to the Windows **Application event log** under the source
 Get-EventLog -LogName Application -Source SmtpRelay -Newest 20
 ```
 
-Registering the event source requires administrative rights, which `install`
-already demands. uvicorn is started with `log_config=None` so its records flow
+`install.ps1` registers the event source, because the virtual service account
+cannot: `NTEventLogHandler` tries on first use and silently ignores the access
+denied, and the result is every record showing as "The description for Event ID
+... cannot be found". Two writers share the source with message tables in two
+files, so `EventMessageFile` lists both: `win32service.pyd` for the app's log
+records (event ID 1) and `servicemanager.pyd` for pywin32's own start, stop and
+failure messages. uvicorn is started with `log_config=None` so its records flow
 through the same handler rather than installing a competing one. Service start,
 stop, and configuration failures are also written via `servicemanager`, so they
 appear even if the logging layer itself failed to initialise.

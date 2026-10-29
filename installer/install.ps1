@@ -164,22 +164,27 @@ if ($LASTEXITCODE -ne 0) {
     $pipWheel = Get-ChildItem $WheelDir -Filter 'pip-*.whl' | Select-Object -First 1
     if (-not $pipWheel) { Stop-WithError "No pip wheel in '$WheelDir' to bootstrap from." }
     Invoke-Checked "pip bootstrap" {
-        & $Python (Join-Path $pipWheel.FullName 'pip') install --no-index --find-links $WheelDir --quiet pip
+        & $Python (Join-Path $pipWheel.FullName 'pip') install --no-index --find-links $WheelDir --quiet --no-warn-script-location pip
     }
 }
-Write-Ok ((& $Python -m pip --version | Select-Object -Last 1))
+$pipVersion = ((& $Python -m pip --version 2>&1 | Out-String) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+if ($LASTEXITCODE -ne 0 -or -not $pipVersion) { Stop-WithError "pip is not runnable after bootstrap." }
+Write-Ok $pipVersion.Trim()
 
 Write-Step "Installing build backend (offline)"
+# --no-warn-script-location throughout: the runtime's Scripts\ directory is
+# private to this service and deliberately never on PATH, so pip's advice to
+# add it is noise on every install.
 # setuptools is needed to build the project's own wheel; pip's build isolation
 # would otherwise contact PyPI.
 Invoke-Checked "build backend install" {
-    & $Python -m pip install --no-index --find-links $WheelDir --quiet setuptools wheel
+    & $Python -m pip install --no-index --find-links $WheelDir --quiet --no-warn-script-location setuptools wheel
 }
 Write-Ok "setuptools + wheel"
 
 Write-Step "Installing dependencies from bundled wheels (offline)"
 Invoke-Checked "dependency install" {
-    & $Python -m pip install --no-index --find-links $WheelDir --quiet -r (Join-Path $InstallDir 'requirements.txt')
+    & $Python -m pip install --no-index --find-links $WheelDir --quiet --no-warn-script-location -r (Join-Path $InstallDir 'requirements.txt')
 }
 Write-Ok "dependencies installed"
 
@@ -187,7 +192,7 @@ Write-Step "Installing smtp-relay"
 # --no-deps: requirements.txt already pinned and installed everything.
 # --no-build-isolation: use the setuptools just installed, no PyPI access.
 Invoke-Checked "project install" {
-    & $Python -m pip install --no-index --find-links $WheelDir --no-deps --no-build-isolation --quiet $InstallDir
+    & $Python -m pip install --no-index --find-links $WheelDir --no-deps --no-build-isolation --quiet --no-warn-script-location $InstallDir
 }
 Write-Ok "smtp-relay $Version installed"
 
@@ -249,6 +254,38 @@ Write-Ok "Service registered"
 
 & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
 Write-Ok "Start type: automatic; restart on failure enabled"
+
+# ----------------------------------------------------------- event log source
+
+Write-Step "Registering Event Log source '$ServiceName'"
+# Two writers share this source, with message tables in two different files:
+#   - Python's NTEventLogHandler (app log records) uses event ID 1, whose "%1"
+#     template lives in win32service.pyd;
+#   - pywin32's servicemanager (start/stop/SvcRun failures, IDs 0x400000FF etc.)
+#     has its table in servicemanager.pyd.
+# EventMessageFile accepts a semicolon-separated list and the Event Log service
+# searches them in order. Without this key, Event Viewer shows every record as
+# "The description for Event ID ... cannot be found".
+#
+# It has to be done HERE, elevated. NTEventLogHandler tries to register the
+# source on first use and silently ignores access denied; under LocalSystem that
+# used to succeed, under the virtual service account it never can.
+$win32Dir = Join-Path $RuntimeDir 'Lib\site-packages\win32'
+$messageFiles = @('win32service.pyd', 'servicemanager.pyd') | ForEach-Object { Join-Path $win32Dir $_ }
+foreach ($file in $messageFiles) {
+    if (-not (Test-Path $file)) {
+        Stop-WithError "Event message file missing: $file" "The pywin32 install in the bundled runtime is incomplete."
+    }
+}
+$eventLogKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\$ServiceName"
+try {
+    New-Item -Path $eventLogKey -Force | Out-Null
+    New-ItemProperty -Path $eventLogKey -Name EventMessageFile -Value ($messageFiles -join ';') -PropertyType ExpandString -Force | Out-Null
+    New-ItemProperty -Path $eventLogKey -Name TypesSupported -Value 7 -PropertyType DWord -Force | Out-Null
+} catch {
+    Stop-WithError "Could not register the Event Log source at $eventLogKey." $_.Exception.Message
+}
+Write-Ok "EventMessageFile: win32service.pyd;servicemanager.pyd"
 
 # -------------------------------------------------------------- permissions
 
