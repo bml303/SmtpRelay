@@ -40,10 +40,10 @@ def test_check_version_requires_agreement(tmp_path):
 @pytest.mark.parametrize(
     "url, slug",
     [
-        ("git@gitea.example.org:beat/SMTPy.git", "beat/SMTPy"),
-        ("https://gitea.example.org/beat/SMTPy.git", "beat/SMTPy"),
-        ("https://gitea.example.org/beat/SMTPy", "beat/SMTPy"),
-        ("ssh://git@gitea.example.org:2222/beat/SMTPy.git", "beat/SMTPy"),
+        ("git@gitea.example.org:beat/SmtpRelay.git", "beat/SmtpRelay"),
+        ("https://gitea.example.org/beat/SmtpRelay.git", "beat/SmtpRelay"),
+        ("https://gitea.example.org/beat/SmtpRelay", "beat/SmtpRelay"),
+        ("ssh://git@gitea.example.org:2222/beat/SmtpRelay.git", "beat/SmtpRelay"),
     ],
 )
 def test_repo_slug_from_remote_url(url, slug):

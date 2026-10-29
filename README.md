@@ -347,7 +347,15 @@ looks like; see History below.
 
 ## Running in Docker
 
-The image works on `linux/amd64` and `linux/arm64`. Nothing in it is
+Published images live in this Gitea's container registry, one multi-arch
+manifest per release covering `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull gitea.softbase.tech/beat/smtprelay:v0.2.2
+```
+
+Image names must be lowercase, hence `smtprelay` for the `SmtpRelay` repository.
+Tags carry the `v` like the git tags. To build it yourself, nothing in it is
 architecture-specific - the only compiled dependency is `pydantic-core`, which has
 manylinux wheels for both - so a single multi-arch build covers both targets:
 
@@ -568,7 +576,7 @@ git commit -am "Release 0.3.0" && git tag -a --cleanup=verbatim v0.3.0 -F notes.
 `.gitea/workflows/release.yaml` then runs the tests, builds both Windows payloads
 with the PowerShell syntax check enabled, writes `SHA256SUMS`, creates or updates
 the release with the assets attached, and builds and pushes the multi-arch image
-as `gitea.softbase.tech/<owner>/smtp-relay:X.Y.Z` and `:latest`. Release notes
+as `gitea.softbase.tech/<owner>/smtprelay:vX.Y.Z` and `:latest`. Release notes
 are the annotated tag's message; a lightweight tag falls back to the commit
 subjects since the previous tag. Tag with `--cleanup=verbatim`, otherwise git
 strips every line starting with `#`, which is every Markdown heading. Every step is idempotent, so re-running a failed

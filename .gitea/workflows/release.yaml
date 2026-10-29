@@ -1,7 +1,7 @@
 # Release pipeline: runs on every `vX.Y.Z` tag.
 #
 #   tests  ->  payloads  (both Windows zips + SHA256SUMS, attached to the release)
-#          ->  image     (multi-arch container, pushed to this Gitea's registry)
+#          ->  image     (multi-arch container, pushed to this Gitea's registry as <owner>/smtprelay:vX.Y.Z)
 #
 # The tag is the source of truth. If it does not match pyproject.toml the run
 # fails before downloading anything, so an artefact can never carry a version
@@ -101,7 +101,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           {
             echo "REGISTRY=$registry"
-            echo "IMAGE=$registry/$owner/smtp-relay"
+            echo "IMAGE=$registry/$owner/smtprelay"
             echo "VERSION=$version"
           } >> "$GITHUB_ENV"
 
@@ -121,7 +121,7 @@ jobs:
           build-args: |
             VERSION=${{ env.VERSION }}
           tags: |
-            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:v${{ env.VERSION }}
             ${{ env.IMAGE }}:latest
           labels: |
             org.opencontainers.image.version=${{ env.VERSION }}
