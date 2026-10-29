@@ -1,0 +1,39 @@
+# A Gitea Actions runner for this repository, as a container. Run it on any
+# Linux box that can reach gitea.softbase.tech and has Docker or Podman:
+#
+#   # 1. registration token: repo Settings -> Actions -> Runners -> "Create new
+#   #    runner", or with the tea CLI's token:
+#   #    curl -X POST -H "Authorization: token $TEA_TOKEN" \
+#   #      https://gitea.softbase.tech/api/v1/repos/beat/SmtpRelay/actions/runners/registration-token
+#   # 2. start it (Docker):
+#   GITEA_RUNNER_REGISTRATION_TOKEN=... docker compose -f .gitea/runner/compose.yaml up -d
+#   #    or rootless Podman:
+#   systemctl --user enable --now podman.socket
+#   DOCKER_SOCK=/run/user/$(id -u)/podman/podman.sock GITEA_RUNNER_REGISTRATION_TOKEN=... \
+#     podman compose -f .gitea/runner/compose.yaml up -d
+#
+# The token is used once, at first start; the resulting registration is kept in
+# the runner-data volume. The `image` job of release.yaml builds a multi-arch
+# container with buildx and QEMU, which needs the job container to be
+# privileged and the host to allow binfmt registration - see config.yaml.
+
+services:
+  runner:
+    image: docker.io/gitea/act_runner:latest
+    restart: unless-stopped
+    environment:
+      GITEA_INSTANCE_URL: https://gitea.softbase.tech
+      GITEA_RUNNER_REGISTRATION_TOKEN: ${GITEA_RUNNER_REGISTRATION_TOKEN:?get one from the repository's Actions settings}
+      GITEA_RUNNER_NAME: ${GITEA_RUNNER_NAME:-smtprelay-runner}
+      # The label release.yaml targets, mapped to the job image.
+      GITEA_RUNNER_LABELS: ubuntu-latest:docker://ghcr.io/catthehacker/ubuntu:act-latest
+      CONFIG_FILE: /config.yaml
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - runner-data:/data
+      # Job containers are started through this socket. Podman's API socket
+      # is Docker-compatible: point DOCKER_SOCK at it.
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+
+volumes:
+  runner-data:

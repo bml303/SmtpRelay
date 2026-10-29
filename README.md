@@ -673,10 +673,16 @@ job converges rather than producing duplicate assets.
 
 Two runner requirements: a runner with the `ubuntu-latest` label must be
 registered for the repository, the owner, or the instance, and the `image` job
-needs that runner to be able to run `docker` (a host-mode runner, or the Docker
-socket mounted into the job container). The automatic `GITHUB_TOKEN` can create
-releases and push packages; if the instance restricts it, add a `REGISTRY_TOKEN`
-secret and the workflow uses that instead.
+needs that runner to be able to run `docker` with privileges (buildx and QEMU
+for the arm64 half). `.gitea/runner/compose.yaml` is a ready-to-run runner with
+exactly that setup; its header has the three commands, and it works with Docker
+or rootless Podman. Registering it needs a registration token from the
+repository's Actions settings, which is deliberately a human step. The
+automatic `GITHUB_TOKEN` can create releases and push packages; if the instance
+restricts it, add a `REGISTRY_TOKEN` secret and the workflow uses that instead.
+Until a runner exists, releases are published by hand as described below, and
+the workflow's first run can be verified with a pre-release tag such as
+`v0.3.2-rc.1`, which the publisher marks as a pre-release automatically.
 
 The same publisher works by hand, which is how 0.2.0 was released:
 
@@ -899,7 +905,10 @@ scripts/
   test_linux_installer.sh  end-to-end install/upgrade/uninstall in a systemd container
   publish_release.py  creates the Gitea release for a tag and attaches the payloads
 .gitea/workflows/
-  release.yaml        on a vX.Y.Z tag: tests, both payloads, release, multi-arch image
+  release.yaml        on a vX.Y.Z tag: tests, four payloads + SBOMs, release, multi-arch image
+.gitea/runner/
+  compose.yaml        a Gitea Actions runner for this repo (Docker or rootless Podman)
+  config.yaml
 installer/
   windows/
     install.ps1       offline installer: runtime, wheels, config, service, ACLs

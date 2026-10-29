@@ -1,0 +1,24 @@
+# act_runner configuration for the SmtpRelay release workflow.
+# Reference: https://gitea.com/gitea/act_runner/src/branch/main/internal/pkg/config/config.example.yaml
+log:
+  level: info
+
+runner:
+  capacity: 1
+  timeout: 3h
+  # release.yaml downloads CPython runtimes and wheels from the internet and
+  # pushes to this Gitea's registry; nothing else is needed.
+  envs: {}
+
+container:
+  # The image job runs docker/setup-qemu-action and buildx inside the job
+  # container, which needs privileges; the payload job does not, but a single
+  # setting covers both. Keep this runner off shared infrastructure.
+  privileged: true
+  # Job containers talk to the same Docker/Podman socket as the runner.
+  docker_host: "-"
+  options: ""
+  valid_volumes: []
+
+cache:
+  enabled: true
