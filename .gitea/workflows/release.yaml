@@ -1,6 +1,6 @@
 # Release pipeline: runs on every `vX.Y.Z` tag.
 #
-#   tests  ->  payloads  (both Windows zips + SHA256SUMS, attached to the release)
+#   tests  ->  payloads  (Windows zips, Linux tarballs, SHA256SUMS, attached to the release)
 #          ->  image     (multi-arch container, pushed to this Gitea's registry as <owner>/smtprelay:vX.Y.Z)
 #
 # The tag is the source of truth. If it does not match pyproject.toml the run
@@ -67,12 +67,17 @@ jobs:
         run: python scripts/build_dist.py --no-bump --platform win_amd64 --zip
       - name: Build win_arm64 payload
         run: python scripts/build_dist.py --no-bump --platform win_arm64 --zip
+      - name: Build linux_x86_64 payload
+        # bash -n and systemd-analyze verify run here; the runner has both.
+        run: python scripts/build_dist.py --no-bump --platform linux_x86_64 --zip
+      - name: Build linux_aarch64 payload
+        run: python scripts/build_dist.py --no-bump --platform linux_aarch64 --zip
 
       - name: Checksums
         run: |
           set -euo pipefail
           cd dist
-          sha256sum SmtpRelay-*.zip | tee SHA256SUMS
+          sha256sum SmtpRelay-*.zip SmtpRelay-*.tar.gz | tee SHA256SUMS
 
       - name: Publish release
         env:
@@ -83,7 +88,7 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --server "$GITHUB_SERVER_URL" \
             --repo "$GITHUB_REPOSITORY" \
-            dist/SmtpRelay-*.zip dist/SHA256SUMS
+            dist/SmtpRelay-*.zip dist/SmtpRelay-*.tar.gz dist/SHA256SUMS
 
   image:
     needs: tests

@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Build a self-contained Windows deployment payload under ``dist/``.
+"""Build a self-contained deployment payload under ``dist/``.
 
 Runs on any host OS. Both the wheels and the CPython runtime are fetched for the
-*target* platform, so a Linux build host produces a payload that installs on
-Windows with no internet access, no C/C++ compiler, and no pre-existing Python.
+*target* platform, so one build host produces payloads that install on Windows
+or Linux with no internet access, no compiler, and no pre-existing Python.
 
-    .venv/bin/python scripts/build_dist.py
-    .venv/bin/python scripts/build_dist.py --runtime-version 3.15.1
+    .venv/bin/python scripts/build_dist.py                              # win_arm64
     .venv/bin/python scripts/build_dist.py --platform win_amd64 --zip
+    .venv/bin/python scripts/build_dist.py --platform linux_x86_64 --zip   # .tar.gz
+    .venv/bin/python scripts/build_dist.py --platform linux_aarch64 --zip
 
-The runtime is bundled rather than discovered because the alternative is fragile
-on a service host: the Python Install Manager puts runtimes in a per-user
-%LOCALAPPDATA% behind app-execution aliases, and a LocalSystem or virtual-service
-account should not depend on one user's profile.
+Windows runtimes come from the nuget CPython packages, Linux runtimes from
+python-build-standalone (the builds `uv` installs); both are full CPython layouts
+with pip bundled. The runtime is bundled rather than discovered because the
+alternative is fragile on a service host: on Windows the Python Install Manager
+hides runtimes behind per-user app-execution aliases, and on Linux the distro
+interpreter is whatever version the distro froze on.
 """
 
 from __future__ import annotations
@@ -29,14 +32,52 @@ import tempfile
 import tomllib
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import tarfile
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIST_ROOT = PROJECT_ROOT / "dist"
 INSTALLER_DIR = PROJECT_ROOT / "installer"
+WINDOWS_INSTALLER_DIR = INSTALLER_DIR / "windows"
+LINUX_INSTALLER_DIR = INSTALLER_DIR / "linux"
 
-#: nuget package id per pip platform tag. There is no 32-bit package.
+
+@dataclass(frozen=True)
+class Target:
+    """One deployable platform."""
+
+    family: str                  #: "windows" | "linux" - which installer ships
+    machine: str                 #: platform_machine for PEP 508 marker evaluation
+    pip_platforms: tuple[str, ...]  #: --platform tags, most specific first
+    archive: str                 #: "zip" | "tar.gz"
+
+    @property
+    def sys_platform(self) -> str:
+        return "win32" if self.family == "windows" else "linux"
+
+
+#: pip's --platform is a single tag per flag, and manylinux wheels are tagged
+#: with the glibc floor they need, so Linux lists every tag a cp315 wheel on
+#: PyPI might carry (pip accepts the flag repeatedly). Nothing here is musl:
+#: python-build-standalone's gnu runtime is what gets bundled.
+TARGETS: dict[str, Target] = {
+    "win_amd64": Target("windows", "AMD64", ("win_amd64",), "zip"),
+    "win_arm64": Target("windows", "ARM64", ("win_arm64",), "zip"),
+    "linux_x86_64": Target(
+        "linux", "x86_64",
+        ("manylinux_2_28_x86_64", "manylinux_2_17_x86_64", "manylinux2014_x86_64", "linux_x86_64"),
+        "tar.gz",
+    ),
+    "linux_aarch64": Target(
+        "linux", "aarch64",
+        ("manylinux_2_28_aarch64", "manylinux_2_17_aarch64", "manylinux2014_aarch64", "linux_aarch64"),
+        "tar.gz",
+    ),
+}
+
+#: nuget package id per Windows platform tag. There is no 32-bit package.
 NUGET_RUNTIME_PACKAGES = {
     "win_amd64": "python",
     "win_arm64": "pythonarm64",
@@ -45,6 +86,19 @@ NUGET_RUNTIME_PACKAGES = {
 NUGET_URL = (
     "https://api.nuget.org/v3-flatcontainer/{pkg}/{version}/{pkg}.{version}.nupkg"
 )
+
+#: python-build-standalone target triple per Linux platform tag. The
+#: ``install_only_stripped`` flavour is a plain, relocatable CPython tree with
+#: pip, without the debug symbols and static libraries of the full builds.
+PBS_TRIPLES = {
+    "linux_x86_64": "x86_64-unknown-linux-gnu",
+    "linux_aarch64": "aarch64-unknown-linux-gnu",
+}
+PBS_LATEST_API = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
+PBS_DOWNLOAD = "https://github.com/astral-sh/python-build-standalone/releases/download/{tag}/{name}"
+#: Pin a python-build-standalone release tag (e.g. 20261026) instead of "latest";
+#: the tag used is recorded in MANIFEST.json either way.
+PBS_RELEASE_ENV = "PBS_RELEASE"
 
 #: Staged into the payload. Deliberately an allowlist: config.toml is excluded
 #: because the developer's copy may hold a real SMTP password or API token.
@@ -121,6 +175,76 @@ def validate_powershell_syntax(scripts: list[Path]) -> None:
         )
 
 
+def validate_bash_syntax(scripts: list[Path]) -> None:
+    """``bash -n`` each script. bash is always present on a Linux build host."""
+    bash = shutil.which("bash")
+    if bash is None:
+        print("  WARNING: no bash found - Linux installer scripts were NOT syntax-checked.")
+        return
+    for script in scripts:
+        result = subprocess.run([bash, "-n", str(script)], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(f"{script.name} has bash syntax errors:\n{result.stderr}")
+        print(f"  parsed OK: {script.name}")
+
+
+def render_unit(template: Path, *, install_dir: str, config_dir: str, user: str, group: str) -> str:
+    """The same four substitutions install.sh performs with sed."""
+    text = template.read_text()
+    for token, value in {
+        "@INSTALL_DIR@": install_dir, "@CONFIG_DIR@": config_dir, "@USER@": user, "@GROUP@": group,
+    }.items():
+        text = text.replace(token, value)
+    leftover = re.search(r"@[A-Z_]+@", text)
+    if leftover:
+        raise SystemExit(f"unrendered token left in {template.name}: {leftover.group(0)}")
+    return text
+
+
+def validate_systemd_unit(template: Path) -> None:
+    """Run ``systemd-analyze verify`` on a rendered copy of the unit template.
+
+    verify insists that ExecStart points at an existing executable, so the
+    rendering points INSTALL_DIR at a scratch tree holding a stub python3. The
+    user has to exist too; the build user does. Skipped with a warning where
+    systemd-analyze is unavailable (macOS, containers without systemd).
+    """
+    analyze = shutil.which("systemd-analyze")
+    if analyze is None:
+        print("  WARNING: no systemd-analyze found - the unit template was NOT verified.")
+        return
+    import getpass
+    import grp
+    user = getpass.getuser()
+    group = grp.getgrgid(os.getgid()).gr_name
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        stub = root / "python" / "bin" / "python3"
+        stub.parent.mkdir(parents=True)
+        stub.write_text("#!/bin/sh\n")
+        stub.chmod(0o755)
+        unit = root / template.name
+        unit.write_text(render_unit(template, install_dir=str(root), config_dir=str(root), user=user, group=group))
+        result = subprocess.run(
+            [analyze, "verify", "--man=no", "--generators=no", str(unit)],
+            capture_output=True, text=True,
+        )
+    ours = [l for l in (result.stdout + result.stderr).splitlines() if template.name in l]
+    for line in ours:
+        print(f"  {line}")
+    if result.returncode != 0 or ours:
+        raise SystemExit(f"systemd-analyze verify rejected {template.name} (above).")
+    print(f"  verified OK: {template.name}")
+
+
+def validate_installer(target: Target) -> None:
+    if target.family == "windows":
+        validate_powershell_syntax(sorted(WINDOWS_INSTALLER_DIR.glob("*.ps1")))
+    else:
+        validate_bash_syntax(sorted(LINUX_INSTALLER_DIR.glob("*.sh")))
+        validate_systemd_unit(LINUX_INSTALLER_DIR / "smtp-relay.service")
+
+
 def read_version() -> str:
     data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
     return data["project"]["version"]
@@ -177,14 +301,39 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> None:
     subprocess.run(cmd, check=True, cwd=cwd)
 
 
-def runtime_package_for(platform: str) -> str:
+def target_for(platform: str) -> Target:
     try:
-        return NUGET_RUNTIME_PACKAGES[platform]
+        return TARGETS[platform]
     except KeyError:
         raise SystemExit(
             f"no bundled CPython for platform {platform!r}; "
-            f"supported: {', '.join(sorted(NUGET_RUNTIME_PACKAGES))}"
+            f"supported: {', '.join(sorted(TARGETS))}"
         ) from None
+
+
+def runtime_package_for(platform: str) -> str:
+    target_for(platform)
+    try:
+        return NUGET_RUNTIME_PACKAGES[platform]
+    except KeyError:
+        raise SystemExit(f"{platform} is not a Windows target; its runtime comes from python-build-standalone") from None
+
+
+def marker_environment(platform: str, runtime_version: str) -> dict[str, str]:
+    """PEP 508 environment for the *target*, for selecting pins and checking the closure."""
+    target = target_for(platform)
+    python_version = wheel_tag_for(runtime_version)
+    full = runtime_version if runtime_version.count(".") == 2 else f"{python_version}.0"
+    return {
+        "sys_platform": target.sys_platform,
+        "os_name": "nt" if target.family == "windows" else "posix",
+        "platform_system": "Windows" if target.family == "windows" else "Linux",
+        "platform_machine": target.machine,
+        "python_version": python_version,
+        "python_full_version": full,
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+    }
 
 
 def wheel_tag_for(runtime_version: str) -> str:
@@ -206,7 +355,79 @@ def wheel_tag_for(runtime_version: str) -> str:
     return f"{parts[0]}.{parts[1]}"
 
 
-def fetch_python_runtime(platform: str, runtime_version: str, dest: Path) -> int:
+def fetch_python_runtime(platform: str, runtime_version: str, dest: Path) -> tuple[int, str]:
+    """Fetch the target's CPython into ``dest``. Returns (file count, source label)."""
+    if target_for(platform).family == "windows":
+        return _fetch_nuget_runtime(platform, runtime_version, dest), f"nuget:{runtime_package_for(platform)}"
+    return _fetch_pbs_runtime(platform, runtime_version, dest)
+
+
+def _latest_pbs_release() -> str:
+    request = urllib.request.Request(
+        PBS_LATEST_API, headers={"Accept": "application/vnd.github+json", "User-Agent": "smtp-relay-build"}
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)["tag_name"]
+
+
+def _fetch_pbs_runtime(platform: str, runtime_version: str, dest: Path) -> tuple[int, str]:
+    """Download a python-build-standalone ``install_only_stripped`` tarball,
+    verify it against the release's SHA256SUMS, and extract it into ``dest``.
+
+    Assets are named ``cpython-<ver>+<release>-<triple>-install_only_stripped.tar.gz``
+    and every asset's hash is in the release's ``SHA256SUMS``; there is no
+    per-file sidecar. The archive's single top-level directory ``python/`` is
+    stripped so ``dest/bin/python3`` is the interpreter, mirroring the Windows
+    layout where ``dest/python.exe`` is.
+    """
+    triple = PBS_TRIPLES[platform]
+    tag = os.environ.get(PBS_RELEASE_ENV) or _latest_pbs_release()
+    name = f"cpython-{runtime_version}+{tag}-{triple}-install_only_stripped.tar.gz"
+    print(f"  fetching {name} from python-build-standalone release {tag}")
+
+    with urllib.request.urlopen(PBS_DOWNLOAD.format(tag=tag, name="SHA256SUMS"), timeout=60) as response:
+        sums = response.read().decode()
+    expected = next((line.split()[0] for line in sums.splitlines() if line.strip().endswith(" " + name) or line.strip().endswith("  " + name)), None)
+    if expected is None:
+        raise SystemExit(
+            f"python-build-standalone release {tag} ships no {name}. Either CPython "
+            f"{runtime_version} is not in that release, or pass {PBS_RELEASE_ENV}=<tag> of one that has it."
+        )
+
+    dest.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / name
+        urllib.request.urlretrieve(PBS_DOWNLOAD.format(tag=tag, name=name), archive)
+        actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if actual != expected:
+            raise SystemExit(f"checksum mismatch for {name}: expected {expected}, got {actual}")
+        print(f"  sha256 verified against release SHA256SUMS")
+
+        extracted = 0
+        with tarfile.open(archive, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.name.startswith("python/"):
+                    raise SystemExit(f"unexpected top-level entry in runtime archive: {member.name}")
+                member.name = member.name[len("python/"):]
+                if not member.name:
+                    continue
+                target = dest / member.name
+                if not target.resolve().is_relative_to(dest.resolve()):
+                    raise SystemExit(f"refusing to extract suspicious path: {member.name}")
+                tf.extract(member, dest, filter="data")
+                if member.isfile():
+                    extracted += 1
+
+    python = dest / "bin" / "python3"
+    if not python.is_file():
+        raise SystemExit(f"runtime extraction produced no bin/python3 in {dest}")
+    if not list(dest.glob("lib/python3.*/ensurepip")):
+        raise SystemExit("bundled runtime has no ensurepip; offline pip bootstrap would fail")
+    print(f"  runtime: {extracted} files -> {dest.name}/")
+    return extracted, f"python-build-standalone:{tag}"
+
+
+def _fetch_nuget_runtime(platform: str, runtime_version: str, dest: Path) -> int:
     """Download the nuget CPython package and extract its ``tools/`` into ``dest``.
 
     The nuget package is a full CPython layout: loose ``Lib/``, ``ensurepip`` with
@@ -253,26 +474,18 @@ def fetch_python_runtime(platform: str, runtime_version: str, dest: Path) -> int
     return extracted
 
 
-def select_windows_requirements(python_version: str, dest: Path) -> Path:
-    """Materialize the pins a Windows install would actually resolve.
+def select_requirements(platform: str, python_version: str, dest: Path) -> Path:
+    """Materialize the pins the *target* would actually resolve.
 
     pip evaluates PEP 508 markers against the *running* interpreter, so handing it
     requirements.txt with --platform win_amd64 produces a false failure: a
     ``sys_platform != 'win32'`` pin stays required while --platform forbids its
-    (absent) Windows wheels. Evaluate the markers for a synthetic Windows
-    environment first, then resolve only the survivors.
+    (absent) Windows wheels. Evaluate the markers for the target first, then
+    resolve only the survivors.
     """
     from packaging.markers import Marker
 
-    env = {
-        "sys_platform": "win32",
-        "os_name": "nt",
-        "platform_system": "Windows",
-        "platform_machine": "AMD64",
-        "python_version": python_version,
-        "python_full_version": f"{python_version}.0",
-        "implementation_name": "cpython",
-    }
+    env = marker_environment(platform, python_version)
 
     selected: list[str] = []
     for raw in (PROJECT_ROOT / "requirements.txt").read_text().splitlines():
@@ -284,20 +497,21 @@ def select_windows_requirements(python_version: str, dest: Path) -> Path:
             selected.append(spec.strip())
 
     dest.write_text("\n".join(selected) + "\n")
-    print(f"  {len(selected)} packages selected for win32 / cp{python_version.replace('.', '')}")
+    print(f"  {len(selected)} packages selected for {env['sys_platform']} / cp{python_version.replace('.', '')}")
     return dest
+
+
+def select_windows_requirements(python_version: str, dest: Path) -> Path:
+    return select_requirements("win_amd64", python_version, dest)
 
 
 def download_wheels(wheel_dir: Path, requirements: Path, platform: str, python_version: str) -> int:
     """Fetch every wheel the target needs. Fails loudly if any would need a build."""
     wheel_dir.mkdir(parents=True, exist_ok=True)
-    base = [
-        sys.executable, "-m", "pip", "download",
-        "--no-deps", "--only-binary=:all:",
-        "--platform", platform,
-        "--python-version", python_version,
-        "--dest", str(wheel_dir),
-    ]
+    base = [sys.executable, "-m", "pip", "download", "--no-deps", "--only-binary=:all:"]
+    for tag in target_for(platform).pip_platforms:
+        base += ["--platform", tag]
+    base += ["--python-version", python_version, "--dest", str(wheel_dir)]
     # --only-binary=:all: is what makes this a compiler check as well as a
     # download: anything without a matching wheel fails here, on the build host,
     # instead of on the target machine demanding MSVC.
@@ -325,17 +539,7 @@ def verify_dependency_closure(
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
 
-    machine = "ARM64" if platform == "win_arm64" else "AMD64"
-    env_base = {
-        "sys_platform": "win32",
-        "os_name": "nt",
-        "platform_system": "Windows",
-        "platform_machine": machine,
-        "python_version": wheel_tag_for(runtime_version),
-        "python_full_version": runtime_version,
-        "implementation_name": "cpython",
-        "platform_python_implementation": "CPython",
-    }
+    env_base = marker_environment(platform, runtime_version)
 
     def norm(name: str) -> str:
         return canonicalize_name(name).replace("_", "-")
@@ -382,7 +586,13 @@ def verify_dependency_closure(
     return missing
 
 
-def stage_source(payload: Path) -> None:
+def installer_files(target: Target) -> list[Path]:
+    if target.family == "windows":
+        return sorted(WINDOWS_INSTALLER_DIR.glob("*.ps1"))
+    return sorted(LINUX_INSTALLER_DIR.glob("*.sh")) + [LINUX_INSTALLER_DIR / "smtp-relay.service"]
+
+
+def stage_source(payload: Path, platform: str = "win_arm64") -> None:
     for name in SOURCE_FILES:
         src = PROJECT_ROOT / name
         if not src.is_file():
@@ -400,10 +610,14 @@ def stage_source(payload: Path) -> None:
             dirs_exist_ok=True,
         )
 
-    for script in sorted(INSTALLER_DIR.glob("*.ps1")):
-        shutil.copy2(script, payload / script.name)
+    files = installer_files(target_for(platform))
+    for script in files:
+        dst = payload / script.name
+        shutil.copy2(script, dst)
+        if script.suffix == ".sh":
+            dst.chmod(0o755)
 
-    print(f"  staged: {', '.join(SOURCE_DIRS + SOURCE_FILES)} + {len(list(INSTALLER_DIR.glob('*.ps1')))} installer script(s)")
+    print(f"  staged: {', '.join(SOURCE_DIRS + SOURCE_FILES)} + {len(files)} installer file(s)")
 
 
 def write_manifest(
@@ -413,6 +627,7 @@ def write_manifest(
     platform: str,
     runtime_version: str,
     runtime_files: int,
+    runtime_source: str = "",
     wheel_count: int,
 ) -> None:
     digest = hashlib.sha256()
@@ -428,8 +643,10 @@ def write_manifest(
         "name": "SmtpRelay",
         "version": version,
         "platform": platform,
+        "family": target_for(platform).family,
         "runtime_version": runtime_version,
         "runtime_files": runtime_files,
+        "runtime_source": runtime_source,
         "wheel_tag": f"cp{runtime_version.split('.')[0]}{runtime_version.split('.')[1]}",
         "wheel_count": wheel_count,
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -439,6 +656,22 @@ def write_manifest(
     }
     (payload / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"  manifest: {len(files)} files, payload sha256 {digest.hexdigest()[:16]}...")
+
+
+def make_tarball(payload: Path) -> Path:
+    """``.tar.gz`` for Linux: it keeps the executable bits on install.sh and
+    bin/python3, which a zip would lose. Named like make_zip, for the same reason."""
+    archive = payload.with_name(payload.name + ".tar.gz")
+    with tarfile.open(archive, "w:gz") as tf:
+        for path in sorted(payload.rglob("*")):
+            if path.is_file() or path.is_symlink():
+                tf.add(path, arcname=path.relative_to(payload.parent).as_posix(), recursive=False)
+    print(f"  archive: {archive.name} ({archive.stat().st_size / 1e6:.1f} MB)")
+    return archive
+
+
+def make_archive(payload: Path, platform: str) -> Path:
+    return make_zip(payload) if target_for(platform).archive == "zip" else make_tarball(payload)
 
 
 def make_zip(payload: Path) -> Path:
@@ -467,7 +700,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--platform", default="win_arm64",
-        choices=sorted(NUGET_RUNTIME_PACKAGES),
+        choices=sorted(TARGETS),
         help="target platform (default: win_arm64)",
     )
     parser.add_argument(
@@ -475,7 +708,10 @@ def main() -> int:
         help=f"bundled CPython version (default: {DEFAULT_RUNTIME_VERSION}); "
              "the wheel tag is derived from it so they cannot disagree",
     )
-    parser.add_argument("--zip", action="store_true", help="also produce a .zip")
+    parser.add_argument(
+        "--zip", "--archive", dest="zip", action="store_true",
+        help="also produce an archive (.zip for Windows targets, .tar.gz for Linux)",
+    )
     parser.add_argument(
         "--keep-existing", action="store_true",
         help="do not delete an existing payload directory",
@@ -512,8 +748,9 @@ def main() -> int:
 
     # Fail before downloading anything: a script the target cannot parse is
     # worthless no matter how correct the payload around it is.
-    print("Syntax-checking installer scripts")
-    validate_powershell_syntax(sorted(INSTALLER_DIR.glob("*.ps1")))
+    target = target_for(args.platform)
+    print("Checking installer scripts")
+    validate_installer(target)
 
     if payload.exists():
         if args.keep_existing:
@@ -522,12 +759,12 @@ def main() -> int:
             shutil.rmtree(payload)
     payload.mkdir(parents=True, exist_ok=True)
 
-    runtime_files = fetch_python_runtime(
+    runtime_files, runtime_source = fetch_python_runtime(
         args.platform, args.runtime_version, payload / RUNTIME_DIRNAME
     )
 
     with tempfile.TemporaryDirectory() as tmp:
-        requirements = select_windows_requirements(python_version, Path(tmp) / "requirements-win.txt")
+        requirements = select_requirements(args.platform, python_version, Path(tmp) / f"requirements-{args.platform}.txt")
         wheel_count = download_wheels(
             payload / "wheels", requirements, args.platform, python_version
         )
@@ -544,12 +781,12 @@ def main() -> int:
             "Dependency closure is incomplete for the target platform:\n"
             f"{detail}\n"
             "Add each missing package to requirements.txt with a "
-            "`; sys_platform == 'win32'` marker, then rebuild. An offline install "
-            "on the target cannot fetch what is not bundled."
+            f"`; sys_platform == '{target.sys_platform}'` marker, then rebuild. An offline "
+            "install on the target cannot fetch what is not bundled."
         )
     print("  dependency closure verified for the target platform")
 
-    stage_source(payload)
+    stage_source(payload, args.platform)
     if version != current:
         # Patch the staged copies so the payload is internally consistent: its
         # pyproject.toml, app.__version__ (served at /health), MANIFEST.json and
@@ -561,15 +798,20 @@ def main() -> int:
         platform=args.platform,
         runtime_version=args.runtime_version,
         runtime_files=runtime_files,
+        runtime_source=runtime_source,
         wheel_count=wheel_count,
     )
     if args.zip:
-        make_zip(payload)
+        make_archive(payload, args.platform)
 
     size = sum(p.stat().st_size for p in payload.rglob("*") if p.is_file())
     print(f"\nDone: {payload} ({size / 1e6:.1f} MB)")
-    print("Copy the payload to the target and, from an elevated prompt:")
-    print("  powershell -ExecutionPolicy Bypass -File .\\install.ps1")
+    if target.family == "windows":
+        print("Copy the payload to the target and, from an elevated prompt:")
+        print("  powershell -ExecutionPolicy Bypass -File .\\install.ps1")
+    else:
+        print("Copy the payload to the target and run:")
+        print("  sudo ./install.sh")
 
     # Only touch the source tree once the payload actually exists, so a failed
     # build does not leave a version bump behind with nothing to show for it.

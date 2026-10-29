@@ -405,6 +405,85 @@ deployment. If a host cannot run containers, `python -m app` under systemd with
 `/etc/smtp-relay/config.toml` is the fallback, and the network-exposure rule
 applies identically there.
 
+## Deploying on Linux (systemd)
+
+The Linux payload is the same idea as the Windows one: a bundled CPython, every
+dependency as a wheel, the application, and an installer that needs **no
+internet, no compiler and no system Python**. systemd is required; on anything
+else, use the container image.
+
+```bash
+.venv/bin/python scripts/build_dist.py --platform linux_x86_64 --zip    # -> .tar.gz
+.venv/bin/python scripts/build_dist.py --platform linux_aarch64 --zip
+```
+
+On the target:
+
+```bash
+tar xzf SmtpRelay-0.3.0-linux_x86_64-cp315.tar.gz
+cd SmtpRelay-0.3.0-linux_x86_64-cp315
+sudo ./install.sh            # add --start to start immediately
+sudoedit /etc/smtp-relay/config.toml
+sudo systemctl start smtp-relay
+journalctl -u smtp-relay -f
+```
+
+`install.sh` does, in order:
+
+1. Validates the payload against `MANIFEST.json` **with the bundled interpreter**,
+   which also proves the payload matches the machine's architecture; a wrong
+   payload fails here, before anything is written.
+2. Creates the system account `smtp-relay`: no home, no shell, no password.
+3. Copies the runtime and application to `/opt/smtp-relay` and installs the
+   pinned dependencies from the bundled wheels, offline. The Windows-only pins
+   in `requirements.txt` are skipped by their markers.
+4. Seeds `/etc/smtp-relay/config.toml` from the template, never overwriting an
+   existing one, owned `root:smtp-relay` mode `0640` inside a `0750` directory,
+   so root can edit it and only the service can read it.
+5. Renders the unit from `smtp-relay.service`, reloads systemd, enables the
+   service, and runs `systemd-analyze verify` on it.
+
+`--force` upgrades in place: the service is stopped, `/opt/smtp-relay` is
+replaced, `/etc/smtp-relay` is preserved. `--install-dir`, `--config-dir`,
+`--service-name` and `--user` override the defaults. `uninstall.sh` reverses it
+and keeps the configuration unless `--remove-config` is passed.
+
+The unit is the Linux equivalent of the Windows least-privilege setup, done the
+systemd way. The process runs as `smtp-relay` with an empty capability set,
+`ProtectSystem=strict` (the whole filesystem read-only except what systemd
+carves out), no home directories, private `/tmp` and `/dev`, no new namespaces
+or personalities, the `@system-service` syscall allowlist, and
+`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`. `RELAY_CONFIG` is set
+explicitly so the service never picks up a stray `config.toml` from a working
+directory. A configuration error exits 2 and is excluded from `Restart=on-failure`
+because retrying it cannot help. To bind a port below 1024 directly, add a
+drop-in with `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather than editing the
+unit.
+
+The sandboxing needs `CAP_SYS_ADMIN` inside whatever systemd is running in,
+which a VM or bare-metal host always has and an unprivileged LXC or Docker
+container may not. In the latter the service fails immediately with
+`status=217/USER` and "Failed to keep CAP_SYS_ADMIN" in the journal; use the
+container image there instead of nesting systemd.
+
+Logs go to stderr and therefore to the journal; there is no file logging. The
+network-exposure rule applies exactly as everywhere else: behind a local reverse
+proxy keep `api.host = "127.0.0.1"`, behind one on another host set
+`api.behind_tls_proxy = true` plus a token.
+
+The runtime comes from [python-build-standalone](https://github.com/astral-sh/python-build-standalone),
+the builds `uv` installs: the `install_only_stripped` glibc flavour, verified
+against the release's `SHA256SUMS` at build time, with the release tag recorded
+in `MANIFEST.json`. Set `PBS_RELEASE=<tag>` to pin a release instead of using the
+latest.
+
+An end-to-end test boots systemd in a Debian container, installs, checks
+`/health`, upgrades in place and uninstalls:
+
+```bash
+scripts/test_linux_installer.sh dist/SmtpRelay-0.3.0-linux_x86_64-cp315
+```
+
 ## Deploying as a Windows service
 
 The relay runs as a **native Windows service** through pywin32 — no external
@@ -472,14 +551,17 @@ pre-existing Python**:
 .venv/bin/python scripts/build_dist.py                        # win_arm64, CPython 3.15.2
 .venv/bin/python scripts/build_dist.py --platform win_amd64
 .venv/bin/python scripts/build_dist.py --runtime-version 3.15.1 --zip
+.venv/bin/python scripts/build_dist.py --platform linux_x86_64 --zip   # see "Deploying on Linux"
 ```
 
-This runs from any host OS, including Linux: both the wheels and the CPython
-runtime are fetched for the *target* platform. Because `--only-binary=:all:` is
-used, a package with no matching wheel fails the build **here** rather than
-demanding MSVC on the target. Markers are evaluated for a synthetic win32
-environment first, since pip otherwise evaluates them against the build host and
-mis-resolves.
+This runs from any host OS: both the wheels and the CPython runtime are fetched
+for the *target* platform (`win_amd64`, `win_arm64`, `linux_x86_64`,
+`linux_aarch64`). Because `--only-binary=:all:` is used, a package with no
+matching wheel fails the build **here** rather than demanding a compiler on the
+target. Markers are evaluated for a synthetic target environment first, since pip
+otherwise evaluates them against the build host and mis-resolves. `--zip`
+produces a `.zip` for Windows targets and a `.tar.gz` for Linux ones, the latter
+because it preserves executable bits.
 
 The wheel tag is **derived** from `--runtime-version` rather than specified
 separately, so the wheels cannot disagree with the bundled interpreter.
@@ -573,8 +655,8 @@ The tag is the source of truth. `vX.Y.Z` must match `version` in
 git commit -am "Release 0.3.0" && git tag -a --cleanup=verbatim v0.3.0 -F notes.md && git push origin main v0.3.0
 ```
 
-`.gitea/workflows/release.yaml` then runs the tests, builds both Windows payloads
-with the PowerShell syntax check enabled, writes `SHA256SUMS`, creates or updates
+`.gitea/workflows/release.yaml` then runs the tests, builds the two Windows and
+two Linux payloads with the installer checks enabled, writes `SHA256SUMS`, creates or updates
 the release with the assets attached, and builds and pushes the multi-arch image
 as `gitea.softbase.tech/<owner>/smtprelay:vX.Y.Z` and `:latest`. Release notes
 are the annotated tag's message; a lightweight tag falls back to the commit
@@ -778,13 +860,19 @@ app/
   windows_service.py  native Windows service (pywin32, Windows only)
 tests/
 scripts/
-  build_dist.py       cross-builds the offline Windows payload
+  build_dist.py       cross-builds the offline payloads (Windows and Linux)
+  test_linux_installer.sh  end-to-end install/upgrade/uninstall in a systemd container
   publish_release.py  creates the Gitea release for a tag and attaches the payloads
 .gitea/workflows/
   release.yaml        on a vX.Y.Z tag: tests, both payloads, release, multi-arch image
 installer/
-  install.ps1         offline installer: venv, wheels, config, service
-  uninstall.ps1
+  windows/
+    install.ps1       offline installer: runtime, wheels, config, service, ACLs
+    uninstall.ps1
+  linux/
+    install.sh        offline installer: runtime, wheels, config, systemd unit
+    uninstall.sh
+    smtp-relay.service  hardened unit template rendered by install.sh
 docker/
   healthcheck.py      container HEALTHCHECK: GET /health via the configured scheme
 Dockerfile            multi-arch (amd64/arm64) image, unprivileged, no secrets baked in

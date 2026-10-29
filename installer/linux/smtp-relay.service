@@ -1,0 +1,63 @@
+# SMTP Relay systemd unit - TEMPLATE. install.sh fills in the @-delimited placeholders and
+# writes the result to /etc/systemd/system/<service-name>.service.
+#
+# The service is a plain foreground process (`python -m app`) that logs to
+# stderr, so the journal is the log. It needs: read access to its runtime under
+# @INSTALL_DIR@, read access to @CONFIG_DIR@/config.toml, a listening TCP socket
+# and outbound SMTP. Everything else is taken away below.
+
+[Unit]
+Description=SMTP Relay (JSON over REST in, mail out through a configured mailhost)
+Documentation=file://@INSTALL_DIR@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# exec, not simple: `systemctl start` then blocks until the sandbox is set up
+# and python3 has actually been exec'd, and fails if that exec fails.
+Type=exec
+User=@USER@
+Group=@GROUP@
+ExecStart=@INSTALL_DIR@/python/bin/python3 -m app
+WorkingDirectory=/
+# Explicit config path: the service must never pick up a stray config.toml from
+# a working directory, and a missing file is then a clear startup error.
+Environment=RELAY_CONFIG=@CONFIG_DIR@/config.toml
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=5s
+# Config errors exit 2 and will not be fixed by retrying.
+RestartPreventExitStatus=2
+
+# --- hardening ----------------------------------------------------------------
+# Nothing here needs a capability: ports >= 1024, no file writes, no signals to
+# other processes. To bind 25/443 directly, add AmbientCapabilities=CAP_NET_BIND_SERVICE
+# to a drop-in rather than editing this file.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

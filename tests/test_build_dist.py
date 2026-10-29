@@ -282,9 +282,72 @@ def test_project_version_sources_currently_agree():
 
 
 def test_installer_scripts_are_present():
-    scripts = sorted(p.name for p in build_dist.INSTALLER_DIR.glob("*.ps1"))
+    windows = sorted(p.name for p in build_dist.WINDOWS_INSTALLER_DIR.glob("*.ps1"))
+    linux = sorted(p.name for p in build_dist.LINUX_INSTALLER_DIR.iterdir())
 
-    assert scripts == ["install.ps1", "uninstall.ps1"]
+    assert windows == ["install.ps1", "uninstall.ps1"]
+    assert linux == ["install.sh", "smtp-relay.service", "uninstall.sh"]
+
+
+def test_targets_cover_both_families_and_archive_kinds():
+    assert set(build_dist.TARGETS) == {"win_amd64", "win_arm64", "linux_x86_64", "linux_aarch64"}
+    for name, target in build_dist.TARGETS.items():
+        assert target.family == ("windows" if name.startswith("win_") else "linux")
+        assert target.archive == ("zip" if target.family == "windows" else "tar.gz")
+    # Linux wheels: glibc-tagged manylinux first, generic linux last.
+    assert build_dist.TARGETS["linux_x86_64"].pip_platforms[0].startswith("manylinux_2_28")
+    assert build_dist.TARGETS["linux_x86_64"].pip_platforms[-1] == "linux_x86_64"
+
+
+def test_select_requirements_for_linux_drops_the_windows_pins(tmp_path, monkeypatch):
+    fake_root = tmp_path / "project"
+    fake_root.mkdir()
+    (fake_root / "requirements.txt").write_text(
+        "fastapi==1.0\n"
+        "pywin32==3.0; sys_platform == 'win32'\n"
+        "colorama==0.4.6; sys_platform == 'win32'\n"
+        "uvloop==2.0; sys_platform != 'win32'\n"
+    )
+    monkeypatch.setattr(build_dist, "PROJECT_ROOT", fake_root)
+    out = tmp_path / "linux.txt"
+
+    build_dist.select_requirements("linux_aarch64", "3.15", out)
+
+    assert out.read_text().split() == ["fastapi==1.0", "uvloop==2.0"]
+
+
+def test_linux_payload_is_staged_with_executable_scripts_and_the_unit(tmp_path):
+    build_dist.stage_source(tmp_path, "linux_x86_64")
+
+    assert (tmp_path / "install.sh").stat().st_mode & 0o111
+    assert (tmp_path / "uninstall.sh").stat().st_mode & 0o111
+    assert (tmp_path / "smtp-relay.service").is_file()
+    assert not (tmp_path / "install.ps1").exists()
+
+
+def test_tarball_preserves_name_and_prefix(tmp_path):
+    import tarfile
+    payload = tmp_path / "SmtpRelay-0.3.0-linux_x86_64-cp315"
+    payload.mkdir()
+    (payload / "install.sh").write_text("#!/bin/sh\n")
+    (payload / "install.sh").chmod(0o755)
+
+    archive = build_dist.make_archive(payload, "linux_x86_64")
+
+    assert archive.name == "SmtpRelay-0.3.0-linux_x86_64-cp315.tar.gz"
+    with tarfile.open(archive) as tf:
+        member = tf.getmember("SmtpRelay-0.3.0-linux_x86_64-cp315/install.sh")
+    assert member.mode & 0o111, "executable bit lost"
+
+
+def test_marker_environment_matches_the_target():
+    win = build_dist.marker_environment("win_arm64", "3.15.2")
+    lin = build_dist.marker_environment("linux_aarch64", "3.15.2")
+
+    assert (win["sys_platform"], win["os_name"], win["platform_machine"]) == ("win32", "nt", "ARM64")
+    assert (lin["sys_platform"], lin["os_name"], lin["platform_machine"]) == ("linux", "posix", "aarch64")
+    assert win["python_version"] == lin["python_version"] == "3.15"
+    assert lin["python_full_version"] == "3.15.2"
 
 
 # --- bundled CPython runtime ----------------------------------------------
@@ -345,14 +408,14 @@ def test_installer_does_not_discover_a_system_interpreter():
     Manager's per-user %LOCALAPPDATA% runtime, which a service account cannot
     rely on.
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     for forbidden in ("py.exe", "Get-Command python", "-m venv", "$PythonExecutable", "$PythonVersion"):
         assert forbidden not in script, f"install.ps1 still contains {forbidden!r}"
 
 
 def test_installer_uses_the_bundled_runtime():
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "$RuntimeSrc" in script
     assert "'python'" in script, "the runtime directory is not copied into InstallDir"
@@ -373,7 +436,7 @@ def test_installer_grants_acls_via_dotnet_not_icacls():
     ``NT SERVICE\\<name>`` form as well. The .NET ACL API takes a
     SecurityIdentifier object and never calls LookupAccountSid.
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert not re.search(r"&\s+icacls\.exe", script), (
         "icacls cannot resolve a virtual service SID; use Get-Acl/Set-Acl"
@@ -399,7 +462,7 @@ def test_config_dir_acls_protect_secrets_without_locking_out_admins():
     Otherwise Set-Acl can leave a directory nobody but the service can open -
     including the administrator who has to edit config.toml.
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "SetAccessRuleProtection($true, $false)" in script
     # The three grants must all be present and applied before Set-Acl.
@@ -417,7 +480,7 @@ def test_installer_resolves_service_sid_with_sc_showsid_and_confirms_with_lsa():
     with 1069 / System event 7038. Checking it at install time turns that into
     an installer error with the cause named, instead of a start failure later.
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "sc.exe showsid" in script, "SID must come from sc.exe showsid"
     assert "S-1-5-80-" in script, "the virtual-service SID prefix is not matched"
@@ -440,7 +503,7 @@ def test_installer_sets_the_account_at_creation_not_afterwards():
     prompted this turned out to be LSA host state cleared by a reboot; see the
     LSA check test. The clean registration is kept as the canonical form.)
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "--username $ServiceAccount" in script
     assert "--username $ServiceAccount --startup auto install" in script
@@ -458,7 +521,7 @@ def test_installer_sets_service_sid_type_unrestricted():
     carries the virtual SID in its token. It must be set explicitly and read
     back, before any grant.
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "sc.exe sidtype $ServiceName unrestricted" in script
     # Must happen before any grant, and be read back rather than assumed.
@@ -468,7 +531,7 @@ def test_installer_sets_service_sid_type_unrestricted():
 
 def test_installer_confirms_the_service_account_took_effect():
     """A silently-ignored account surfaces later as a permissions or logon failure."""
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "sc.exe qc" in script
     assert "SERVICE_START_NAME" in script
@@ -476,14 +539,14 @@ def test_installer_confirms_the_service_account_took_effect():
 
 def test_acl_failure_is_fatal_not_a_warning():
     """Without these grants the service cannot read its runtime or config."""
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "$aclFailures" in script
     assert "Stop-WithError" in script.split("$aclFailures.Count")[1][:400]
 
 
 def test_uninstaller_uses_the_bundled_runtime():
-    script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "uninstall.ps1").read_text()
 
     assert "python\\python.exe" in script
     assert ".venv" not in script
@@ -514,7 +577,7 @@ def test_uninstaller_removes_every_artifact_the_installer_creates():
     install.ps1 -OpenFirewall creates an inbound rule. Both would otherwise
     survive every reinstall, so a subsequent run would not be a clean test.
     """
-    script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "uninstall.ps1").read_text()
 
     assert "EventLog\\Application\\$ServiceName" in script, "Event Log source not removed"
     assert "Remove-NetFirewallRule" in script, "firewall rule not removed"
@@ -526,8 +589,8 @@ def test_uninstaller_removes_every_artifact_the_installer_creates():
 
 def test_uninstaller_rule_name_matches_the_installer():
     """A display-name mismatch would silently leave the firewall rule behind."""
-    install = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
-    uninstall = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+    install = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
+    uninstall = (build_dist.WINDOWS_INSTALLER_DIR / "uninstall.ps1").read_text()
 
     created = re.search(r'New-NetFirewallRule\s+-DisplayName\s+"([^"]+)"', install)
     removed = re.search(r'\$ruleName\s*=\s*"([^"]+)"', uninstall)
@@ -539,7 +602,7 @@ def test_uninstaller_rule_name_matches_the_installer():
 
 def test_uninstaller_offers_a_clean_slate_switch():
     """Config is preserved by default, so removal must be explicitly available."""
-    script = (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "uninstall.ps1").read_text()
 
     assert "[switch] $RemoveConfig" in script
     assert "-RemoveConfig" in script
@@ -636,18 +699,18 @@ def test_installer_registers_the_event_log_source_with_both_message_files():
     ... cannot be found". Two writers, two message tables: win32service.pyd for
     the app's ID-1 records and servicemanager.pyd for pywin32's own messages.
     """
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
 
     assert "EventLog\\Application\\$ServiceName" in script
     assert "'win32service.pyd', 'servicemanager.pyd'" in script
     assert "EventMessageFile" in script and "TypesSupported" in script
     # uninstall must remove what install registers.
-    assert "EventLog\\Application\\$ServiceName" in (build_dist.INSTALLER_DIR / "uninstall.ps1").read_text()
+    assert "EventLog\\Application\\$ServiceName" in (build_dist.WINDOWS_INSTALLER_DIR / "uninstall.ps1").read_text()
 
 
 def test_installer_suppresses_pip_script_location_warnings():
     """Scripts\\ in the private runtime is never on PATH; the advice is noise."""
-    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
     installs = [l for l in script.splitlines() if "pip" in l and " install " in l and not l.lstrip().startswith("#")]
     assert installs
     for line in installs:
