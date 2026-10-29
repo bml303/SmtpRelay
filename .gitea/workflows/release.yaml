@@ -14,8 +14,10 @@
 #   - a runner with the `ubuntu-latest` label;
 #   - for the `image` job, that runner must be able to run `docker` (a host-mode
 #     runner, or the Docker socket mounted into the job container).
-# The automatic GITHUB_TOKEN can create releases and push packages. If your
-# instance restricts it, add a `REGISTRY_TOKEN` secret and it is used instead.
+# The automatic GITHUB_TOKEN can create releases and upload assets, but on this
+# instance it cannot log in to the container registry (401 on the first real
+# run). Add a `REGISTRY_TOKEN` repository secret - a personal access token with
+# write:package - and both the registry login and the publisher use it.
 
 name: release
 
@@ -157,12 +159,22 @@ jobs:
           done
 
       - name: Attach image SBOMs to the release
+        # SHA256SUMS was written by the payloads job before these files existed;
+        # fetch it from the release, append the image SBOM lines, and replace it.
         env:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          sums_url=$(curl -sSf -H "Authorization: token $GITEA_TOKEN" \
+            "$api/releases/tags/$GITHUB_REF_NAME" | python -c \
+            'import json,sys; print(next(a["browser_download_url"] for a in json.load(sys.stdin)["assets"] if a["name"]=="SHA256SUMS"))')
+          curl -sSf -H "Authorization: token $GITEA_TOKEN" -o dist/SHA256SUMS "$sums_url"
+          grep -v -- '-image-' dist/SHA256SUMS > dist/SHA256SUMS.new
+          (cd dist && sha256sum SmtpRelay-*-image-*.cdx.json) >> dist/SHA256SUMS.new
+          mv dist/SHA256SUMS.new dist/SHA256SUMS
           python scripts/publish_release.py publish \
             --tag "$GITHUB_REF_NAME" \
             --server "$GITHUB_SERVER_URL" \
             --repo "$GITHUB_REPOSITORY" \
-            dist/SmtpRelay-*-image-*.cdx.json
+            dist/SmtpRelay-*-image-*.cdx.json dist/SHA256SUMS
