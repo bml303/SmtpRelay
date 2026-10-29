@@ -1,0 +1,129 @@
+# Release pipeline: runs on every `vX.Y.Z` tag.
+#
+#   tests  ->  payloads  (both Windows zips + SHA256SUMS, attached to the release)
+#          ->  image     (multi-arch container, pushed to this Gitea's registry)
+#
+# The tag is the source of truth. If it does not match pyproject.toml the run
+# fails before downloading anything, so an artefact can never carry a version
+# its own /health endpoint denies.
+#
+# Runner requirements (see "Releasing" in the README):
+#   - a runner with the `ubuntu-latest` label;
+#   - for the `image` job, that runner must be able to run `docker` (a host-mode
+#     runner, or the Docker socket mounted into the job container).
+# The automatic GITHUB_TOKEN can create releases and push packages. If your
+# instance restricts it, add a `REGISTRY_TOKEN` secret and it is used instead.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+      - name: Tag must match pyproject.toml
+        run: python scripts/publish_release.py check-version --tag "$GITHUB_REF_NAME"
+      - name: Test
+        run: python -m pytest
+
+  payloads:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release_notes() reads the tag annotation and the previous tag.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install PowerShell
+        # build_dist.py syntax-checks install.ps1/uninstall.ps1 with the real
+        # PowerShell parser; without pwsh it only warns, and a parse error
+        # would then reach the target machine.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/msprod.deb
+          sudo dpkg -i /tmp/msprod.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq powershell
+          pwsh -NoLogo -Command '$PSVersionTable.PSVersion.ToString()'
+
+      - name: Build win_amd64 payload
+        run: python scripts/build_dist.py --no-bump --platform win_amd64 --zip
+      - name: Build win_arm64 payload
+        run: python scripts/build_dist.py --no-bump --platform win_arm64 --zip
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum SmtpRelay-*.zip | tee SHA256SUMS
+
+      - name: Publish release
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python scripts/publish_release.py publish \
+            --tag "$GITHUB_REF_NAME" \
+            --server "$GITHUB_SERVER_URL" \
+            --repo "$GITHUB_REPOSITORY" \
+            dist/SmtpRelay-*.zip dist/SHA256SUMS
+
+  image:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image coordinates
+        # Image references must be lowercase; the repository slug is not.
+        run: |
+          set -euo pipefail
+          registry="${GITHUB_SERVER_URL#https://}"
+          registry="${registry#http://}"
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "REGISTRY=$registry"
+            echo "IMAGE=$registry/$owner/smtp-relay"
+            echo "VERSION=$version"
+          } >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

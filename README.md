@@ -551,6 +551,48 @@ stops `.pth` processing — and pywin32 depends on `pywin32.pth` to put `win32` 
 win32service` fails and the service cannot start. `build_dist.py` refuses a runtime
 containing a `._pth` file, and asserts `ensurepip` is present.
 
+### Releasing
+
+Payloads are **not** committed; each is about 32 MB and git would keep every one
+forever. A release is a tag plus attachments on the Gitea release page, and the
+container image goes to this Gitea's package registry.
+
+The tag is the source of truth. `vX.Y.Z` must match `version` in
+`pyproject.toml`, otherwise the pipeline stops before downloading anything:
+
+```bash
+.venv/bin/python scripts/build_dist.py --version 0.3.0 --no-bump --platform win_arm64 --zip   # sets the version
+git commit -am "Release 0.3.0" && git tag -a v0.3.0 -m "..." && git push origin main v0.3.0
+```
+
+`.gitea/workflows/release.yaml` then runs the tests, builds both Windows payloads
+with the PowerShell syntax check enabled, writes `SHA256SUMS`, creates or updates
+the release with the assets attached, and builds and pushes the multi-arch image
+as `gitea.softbase.tech/<owner>/smtp-relay:X.Y.Z` and `:latest`. Release notes
+are the annotated tag's message; a lightweight tag falls back to the commit
+subjects since the previous tag. Every step is idempotent, so re-running a failed
+job converges rather than producing duplicate assets.
+
+Two runner requirements: a runner with the `ubuntu-latest` label must be
+registered for the repository, the owner, or the instance, and the `image` job
+needs that runner to be able to run `docker` (a host-mode runner, or the Docker
+socket mounted into the job container). The automatic `GITHUB_TOKEN` can create
+releases and push packages; if the instance restricts it, add a `REGISTRY_TOKEN`
+secret and the workflow uses that instead.
+
+The same publisher works by hand, which is how 0.2.0 was released:
+
+```bash
+.venv/bin/python scripts/build_dist.py --no-bump --platform win_amd64 --zip
+.venv/bin/python scripts/build_dist.py --no-bump --platform win_arm64 --zip
+(cd dist && sha256sum SmtpRelay-0.3.0-*.zip > SHA256SUMS)
+GITEA_TOKEN=... .venv/bin/python scripts/publish_release.py publish --tag v0.3.0 \
+    dist/SmtpRelay-0.3.0-*.zip dist/SHA256SUMS
+```
+
+`publish_release.py check-version --tag vX.Y.Z` and `notes --tag vX.Y.Z` show
+what the pipeline would do without touching the server.
+
 ### Configuration discovery
 
 Two facts make this non-obvious for a service: the SCM starts it with the working
@@ -706,6 +748,9 @@ app/
 tests/
 scripts/
   build_dist.py       cross-builds the offline Windows payload
+  publish_release.py  creates the Gitea release for a tag and attaches the payloads
+.gitea/workflows/
+  release.yaml        on a vX.Y.Z tag: tests, both payloads, release, multi-arch image
 installer/
   install.ps1         offline installer: venv, wheels, config, service
   uninstall.ps1
