@@ -145,3 +145,82 @@ def test_token_alone_without_tls_is_still_rejected(tmp_path):
         build(ApiConfig(host="0.0.0.0", token="s3cret"))
 
     assert "cleartext" in str(excinfo.value)
+
+
+# --- behind a TLS-terminating proxy ------------------------------------------
+#
+# The container deployment: the app binds 0.0.0.0 and a reverse proxy or
+# ingress on a private network terminates TLS. The opt-out waives the TLS half
+# of the rule and nothing else.
+
+
+def test_behind_proxy_with_token_is_accepted_in_cleartext():
+    config = build(ApiConfig(host="0.0.0.0", behind_tls_proxy=True, token="s3cret"))
+
+    assert config.api.tls_enabled is False
+    assert config.api.scheme == "http"
+    assert config.api.uvicorn_ssl_kwargs() == {}
+
+
+def test_behind_proxy_still_requires_authentication():
+    """The proxy keeps the token off the wire; it does not stop anyone relaying."""
+    with pytest.raises(ValidationError) as excinfo:
+        build(ApiConfig(host="0.0.0.0", behind_tls_proxy=True))
+
+    message = str(excinfo.value)
+    assert "relay mail through it" in message
+    assert "cleartext" not in message
+
+
+def test_behind_proxy_and_own_certfile_are_mutually_exclusive():
+    """TLS is terminated in exactly one place; both set means one is misunderstood."""
+    with pytest.raises(ValidationError) as excinfo:
+        ApiConfig(host="0.0.0.0", behind_tls_proxy=True, ssl_certfile=CERT, token="s3cret")
+
+    assert "behind_tls_proxy" in str(excinfo.value)
+    assert "ssl_certfile" in str(excinfo.value)
+
+
+def test_behind_proxy_on_loopback_is_harmless():
+    """Not a misconfiguration, so no error: the rule never applied on loopback."""
+    config = build(ApiConfig(behind_tls_proxy=True))
+
+    assert config.api.host in LOOPBACK_HOSTS
+
+
+def test_cleartext_rejection_names_the_opt_out():
+    """An operator putting this in a container should learn the right knob."""
+    with pytest.raises(ValidationError) as excinfo:
+        build(ApiConfig(host="0.0.0.0", token="s3cret"))
+
+    assert "api.behind_tls_proxy" in str(excinfo.value)
+
+
+def test_behind_proxy_via_environment(tmp_path, monkeypatch):
+    """The container sets everything through the environment, with no file."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("app.config.PACKAGE_ROOT", tmp_path / "install-root")
+    monkeypatch.setattr("app.config._system_config_dir", lambda: None)
+    monkeypatch.setenv("RELAY_API_HOST", "0.0.0.0")
+    monkeypatch.setenv("RELAY_API_BEHIND_TLS_PROXY", "true")
+    monkeypatch.setenv("RELAY_API_TOKEN", "s3cret")
+    monkeypatch.setenv("RELAY_SMTP_HOST", "mail.example.com")
+    monkeypatch.setenv("RELAY_SENDER", "relay@example.com")
+    monkeypatch.setenv("RELAY_ALLOWED_DOMAINS", "example.com")
+
+    config = load_config()
+
+    assert config.api.behind_tls_proxy is True
+    assert config.api.host == "0.0.0.0"
+
+
+def test_env_opt_out_without_token_is_still_rejected(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text(MINIMAL_TOML)
+    monkeypatch.setenv("RELAY_API_HOST", "0.0.0.0")
+    monkeypatch.setenv("RELAY_API_BEHIND_TLS_PROXY", "1")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+
+    assert "relay mail through it" in str(excinfo.value)

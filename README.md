@@ -135,6 +135,7 @@ annotated template.
 | `RELAY_API_SSL_KEYFILE_PASSWORD` | `api.ssl_keyfile_password` |
 | `RELAY_API_SSL_CA_CERTS` | `api.ssl_ca_certs` |
 | `RELAY_API_SSL_CERT_REQS` | `api.ssl_cert_reqs` |
+| `RELAY_API_BEHIND_TLS_PROXY` | `api.behind_tls_proxy` |
 | `RELAY_SMTP_HOST` | `smtp.host` |
 | `RELAY_SMTP_PORT` | `smtp.port` |
 | `RELAY_SMTP_SECURITY` | `smtp.security` |
@@ -232,8 +233,31 @@ Clients then present a certificate chaining to `client-ca.pem`; anything else â€
 no certificate, or one signed by a different CA â€” is refused during the TLS
 handshake, before any HTTP request is parsed.
 
-If you terminate TLS in a reverse proxy instead, leave `api.ssl_*` unset, keep
-`api.host = "127.0.0.1"`, and have the proxy forward to it.
+### Behind a TLS-terminating reverse proxy
+
+If a reverse proxy terminates TLS, leave `api.ssl_*` unset and have the proxy
+forward to the relay. On the same host, keep `api.host = "127.0.0.1"` and nothing
+more is needed.
+
+When the proxy is *not* on the same host - a container behind an ingress, or a
+proxy on a private network - the relay has to bind `0.0.0.0`, which trips the
+network-exposure rule. `api.behind_tls_proxy = true` is the deliberate opt-out for
+exactly that case:
+
+```toml
+[api]
+host = "0.0.0.0"
+behind_tls_proxy = true
+# token still required - see below
+```
+
+It waives **only the TLS half** of the rule. The proxy keeps the token off the
+public wire, but it does not stop anyone who can reach the relay's port from
+submitting mail, so `api.token` (or required mTLS) is still demanded and nothing
+waives that. Setting `behind_tls_proxy` together with `ssl_certfile` is rejected:
+TLS is terminated in exactly one place, and both set means one of them is
+misunderstood. The flag is only honest on a private network segment; do not use
+it to expose cleartext across a network you do not control.
 
 ### Recipient allowlist
 
@@ -320,6 +344,58 @@ passes against the real `smtplib` signatures, and
 `test_ssl_kwargs_bind_to_the_real_uvicorn_config` does the same for the uvicorn TLS
 arguments. They exist because a fake object can only encode what we assume a library
 looks like; see History below.
+
+## Running in Docker
+
+The image works on `linux/amd64` and `linux/arm64`. Nothing in it is
+architecture-specific - the only compiled dependency is `pydantic-core`, which has
+manylinux wheels for both - so a single multi-arch build covers both targets:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION=$(python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])') \
+  -t smtp-relay:0.2.0 .
+```
+
+What the image does, and deliberately does not do:
+
+- Installs the project into a venv from `python:3.15-slim`, with `requirements.txt`
+  used as a constraints file so the runtime set is pinned to the tested versions
+  while the test-only packages stay out.
+- Runs as the unprivileged user `relay` (uid 10001), logs to stdout, and reads
+  configuration from `/etc/smtp-relay/config.toml` and/or `RELAY_*` variables.
+  `config.toml` from the checkout is excluded by both the `COPY` allowlist and
+  `.dockerignore`, so a local token or password cannot end up in a layer.
+- Sets `RELAY_API_HOST=0.0.0.0`, because a container bound to loopback is
+  unreachable. That is the **only** exposure-related default. The TLS/auth
+  decision stays with you: without either a mounted certificate or
+  `RELAY_API_BEHIND_TLS_PROXY=true`, plus `RELAY_API_TOKEN`, the container exits
+  with code 2 and the same message the service would print on Windows.
+- Declares a `HEALTHCHECK` that calls `GET /health` through the configured scheme
+  and port. Docker honours it; Podman ignores it unless built with
+  `--format docker`. Disable it under `ssl_cert_reqs = "required"`, because the
+  probe has no client certificate.
+
+The usual deployment, behind a reverse proxy that terminates TLS:
+
+```bash
+cp config.example.toml config.toml   # smtp.*, policy.*; leave api.host alone
+RELAY_API_TOKEN=... RELAY_SMTP_PASSWORD=... docker compose up -d
+curl -s http://127.0.0.1:8000/health
+```
+
+`compose.yaml` mounts `./config.toml` read-only at `/etc/smtp-relay/config.toml`,
+publishes the port on loopback only (so just the local proxy can reach it), and
+runs the container with a read-only root filesystem, all capabilities dropped and
+`no-new-privileges`. For an ingress on a private network, drop the `127.0.0.1:`
+prefix from the port mapping. To have the relay serve TLS itself instead, mount
+the certificate and key, set `RELAY_API_SSL_CERTFILE` / `RELAY_API_SSL_KEYFILE`,
+and leave `RELAY_API_BEHIND_TLS_PROXY` unset.
+
+There is no native Linux payload or systemd unit; the image is the Linux
+deployment. If a host cannot run containers, `python -m app` under systemd with
+`/etc/smtp-relay/config.toml` is the fallback, and the network-exposure rule
+applies identically there.
 
 ## Deploying as a Windows service
 
@@ -633,6 +709,10 @@ scripts/
 installer/
   install.ps1         offline installer: venv, wheels, config, service
   uninstall.ps1
+docker/
+  healthcheck.py      container HEALTHCHECK: GET /health via the configured scheme
+Dockerfile            multi-arch (amd64/arm64) image, unprivileged, no secrets baked in
+compose.yaml          reference deployment behind a TLS-terminating proxy
 config.example.toml   annotated configuration template
 requirements.txt      fully pinned, cross-platform dependency set
 ```

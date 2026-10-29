@@ -1,0 +1,18 @@
+# The Dockerfile COPYs an explicit allowlist, so this is a second line of
+# defence - above all for config.toml, which may hold a mailhost password or
+# API token and must never end up in an image layer.
+config.toml
+.env
+
+.git
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+*.egg-info
+build
+dist
+tests
+installer
+scripts
+.qwen

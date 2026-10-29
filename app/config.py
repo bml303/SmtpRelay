@@ -92,6 +92,26 @@ class ApiConfig(BaseModel):
     ssl_ca_certs: Path | None = None
     ssl_cert_reqs: SslVerifyMode | None = None
 
+    #: Declares that a reverse proxy or ingress on a private network terminates
+    #: TLS in front of this process - the usual container deployment, where the
+    #: app must bind 0.0.0.0 to be reachable at all. It waives only the TLS half
+    #: of the network-exposure rule in :class:`AppConfig`; authentication is
+    #: still required, because a proxy does nothing to stop whoever can reach it
+    #: from relaying mail. Mutually exclusive with ``ssl_certfile``: TLS is
+    #: terminated in exactly one place.
+    behind_tls_proxy: bool = False
+
+    @model_validator(mode="after")
+    def _tls_is_terminated_in_one_place(self) -> "ApiConfig":
+        if self.behind_tls_proxy and self.ssl_certfile is not None:
+            raise ValueError(
+                "api.behind_tls_proxy = true says a reverse proxy terminates TLS, "
+                "but api.ssl_certfile makes this process terminate it as well. "
+                "Behind a proxy leave the api.ssl_* keys unset; to serve TLS from "
+                "this process, drop behind_tls_proxy."
+            )
+        return self
+
     @model_validator(mode="after")
     def _require_certfile_for_tls(self) -> "ApiConfig":
         """Reject a half-configured TLS setup at startup, not inside uvicorn."""
@@ -205,15 +225,22 @@ class AppConfig(BaseModel):
         ``ssl_cert_reqs = "optional"`` does not count as authentication - clients
         may simply present no certificate - so only a bearer token or required
         mutual TLS satisfies the check.
+
+        ``api.behind_tls_proxy`` is the one deliberate opt-out, and it covers the
+        TLS half only: a proxy that terminates TLS on a private network keeps the
+        token off the wire, but it does not authenticate anyone, so a token or
+        required mTLS is still demanded. Nothing waives the authentication half.
         """
         if self.api.host in LOOPBACK_HOSTS:
             return self
 
         problems = []
-        if not self.api.tls_enabled:
+        if not self.api.tls_enabled and not self.api.behind_tls_proxy:
             problems.append(
                 "api.ssl_certfile is unset, so traffic including the bearer "
-                "token would cross the network in cleartext"
+                "token would cross the network in cleartext (set "
+                "api.behind_tls_proxy = true only when a reverse proxy on a "
+                "private network terminates TLS for it)"
             )
         authenticates = self.api.token is not None or self.api.ssl_cert_reqs == "required"
         if not authenticates:
@@ -242,6 +269,7 @@ _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     "RELAY_API_SSL_KEYFILE_PASSWORD": ("api", "ssl_keyfile_password"),
     "RELAY_API_SSL_CA_CERTS": ("api", "ssl_ca_certs"),
     "RELAY_API_SSL_CERT_REQS": ("api", "ssl_cert_reqs"),
+    "RELAY_API_BEHIND_TLS_PROXY": ("api", "behind_tls_proxy"),
     "RELAY_SMTP_HOST": ("smtp", "host"),
     "RELAY_SMTP_PORT": ("smtp", "port"),
     "RELAY_SMTP_SECURITY": ("smtp", "security"),
@@ -325,7 +353,10 @@ def _candidate_paths(explicit: str | os.PathLike[str] | None) -> tuple[list[Path
     if system_dir is not None:
         candidates.append(system_dir / name)
     candidates.append(PACKAGE_ROOT / name)
-    return candidates, False
+    # The container's working directory *is* the system config dir, which would
+    # otherwise list the same path twice in "Searched: ..." messages.
+    unique = list(dict.fromkeys(candidates))
+    return unique, False
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:

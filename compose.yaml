@@ -1,0 +1,34 @@
+# Reference deployment behind a TLS-terminating reverse proxy on the same host
+# or a private network. The relay itself speaks plain HTTP on the published
+# port and relies on the proxy for TLS, which is why RELAY_API_BEHIND_TLS_PROXY
+# is set. The bearer token is still mandatory: the proxy does not stop whoever
+# can reach it from relaying mail.
+#
+#   RELAY_API_TOKEN=... RELAY_SMTP_PASSWORD=... docker compose up -d
+#
+# Put the rest of the configuration in ./config.toml (start from
+# config.example.toml); it is mounted read-only at the path the app searches.
+
+services:
+  smtp-relay:
+    build:
+      context: .
+    image: smtp-relay:local
+    ports:
+      # Publish on loopback only: the proxy connects locally, nothing else should.
+      # Behind an ingress on a private network, drop the 127.0.0.1 prefix.
+      - "127.0.0.1:8000:8000"
+    environment:
+      RELAY_API_BEHIND_TLS_PROXY: "true"
+      RELAY_API_TOKEN: ${RELAY_API_TOKEN:?set RELAY_API_TOKEN in the environment or a .env file}
+      RELAY_SMTP_PASSWORD: ${RELAY_SMTP_PASSWORD:-}
+    volumes:
+      - ./config.toml:/etc/smtp-relay/config.toml:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

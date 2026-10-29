@@ -36,6 +36,15 @@ max_recipients = 50
 # "none" | "optional" | "required"; mapped to ssl.VerifyMode for uvicorn.
 # ssl_cert_reqs = "required"
 
+# Behind a reverse proxy or ingress that terminates TLS on a private network
+# (the usual container deployment), the app must bind 0.0.0.0 but should not
+# serve TLS itself. This waives ONLY the TLS half of the rule above: token (or
+# mTLS at the proxy is invisible here, so token) is still required, because a
+# proxy does not stop anyone who can reach it from relaying mail. Mutually
+# exclusive with ssl_certfile. Prefer RELAY_API_BEHIND_TLS_PROXY=true in the
+# container environment over writing it here.
+# behind_tls_proxy = false
+
 [smtp]
 host = "mail.example.com"
 # 465 = implicit TLS, 587 = STARTTLS, 25 = usually plaintext
