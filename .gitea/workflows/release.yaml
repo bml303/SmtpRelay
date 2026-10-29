@@ -114,10 +114,18 @@ jobs:
           registry="${registry#http://}"
           owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           version="${GITHUB_REF_NAME#v}"
+          # A pre-release (vX.Y.Z-rc.1) must never move the `latest` tag.
+          case "$version" in
+            *-*) tags="$registry/$owner/smtprelay:v$version" ;;
+            *)   tags="$registry/$owner/smtprelay:v$version"$'\n'"$registry/$owner/smtprelay:latest" ;;
+          esac
           {
             echo "REGISTRY=$registry"
             echo "IMAGE=$registry/$owner/smtprelay"
             echo "VERSION=$version"
+            echo "IMAGE_TAGS<<EOF"
+            echo "$tags"
+            echo "EOF"
           } >> "$GITHUB_ENV"
 
       - uses: docker/setup-qemu-action@v3
@@ -135,9 +143,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ env.VERSION }}
-          tags: |
-            ${{ env.IMAGE }}:v${{ env.VERSION }}
-            ${{ env.IMAGE }}:latest
+          tags: ${{ env.IMAGE_TAGS }}
           labels: |
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.revision=${{ github.sha }}
