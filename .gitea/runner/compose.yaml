@@ -11,6 +11,14 @@
 #   systemctl --user enable --now podman.socket
 #   DOCKER_SOCK=/run/user/$(id -u)/podman/podman.sock GITEA_RUNNER_REGISTRATION_TOKEN=... \
 #     podman compose -f .gitea/runner/compose.yaml up -d
+#   #    or rootful inside a `podman machine` VM (what the project's own runner does):
+#   podman -c podman-machine-default-root run -d --name smtprelay-runner --restart unless-stopped \
+#     --security-opt label=disable -e GITEA_INSTANCE_URL=https://gitea.softbase.tech \
+#     -e GITEA_RUNNER_REGISTRATION_TOKEN=... -e GITEA_RUNNER_NAME=podman-machine \
+#     -e GITEA_RUNNER_LABELS='ubuntu-latest:docker://ghcr.io/catthehacker/ubuntu:act-latest' \
+#     -e CONFIG_FILE=/config.yaml -v $PWD/.gitea/runner/config.yaml:/config.yaml:ro \
+#     -v smtprelay-runner-data:/data -v /run/podman/podman.sock:/var/run/docker.sock \
+#     docker.io/gitea/act_runner:latest
 #
 # The token is used once, at first start; the resulting registration is kept in
 # the runner-data volume. The `image` job of release.yaml builds a multi-arch

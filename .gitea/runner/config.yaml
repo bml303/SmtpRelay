@@ -15,8 +15,9 @@ container:
   # container, which needs privileges; the payload job does not, but a single
   # setting covers both. Keep this runner off shared infrastructure.
   privileged: true
-  # Job containers talk to the same Docker/Podman socket as the runner.
-  docker_host: "-"
+  # Auto-detect the engine socket and mount it into job containers too: the
+  # image job runs docker buildx inside its job container.
+  docker_host: ""
   options: ""
   valid_volumes: []
 
