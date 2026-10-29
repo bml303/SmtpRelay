@@ -408,37 +408,55 @@ def test_config_dir_acls_protect_secrets_without_locking_out_admins():
     assert script.index("SetAccessRuleProtection") < script.index("Set-Acl -Path $ConfigDir")
 
 
-def test_installer_resolves_service_sid_with_sc_showsid():
-    """LookupAccountName cannot resolve "NT SERVICE\\<name>".
+def test_installer_resolves_service_sid_with_sc_showsid_and_confirms_with_lsa():
+    """`sc.exe showsid` computes the virtual SID from the name; LSA must agree.
 
-    Confirmed on a real Windows 11 ARM64 host: both NTAccount.Translate and
-    icacls-by-name fail with 1332 ERROR_NONE_MAPPED even though the service
-    exists and `sc.exe config obj=` accepted the account. `sc.exe showsid`
-    computes the virtual-account SID directly, so it must be the primary path
-    and name lookup only a fallback.
+    The LSA lookup is the same one the SCM performs at logon. On Windows 11
+    build 28000 ARM64 it failed with 1332 ERROR_NONE_MAPPED for a service whose
+    account had been set after creation, and the service then failed to start
+    with 1069 / System event 7038. Checking it at install time turns that into
+    an installer error with the cause named, instead of a start failure later.
     """
     script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
 
     assert "sc.exe showsid" in script, "SID must come from sc.exe showsid"
     assert "S-1-5-80-" in script, "the virtual-service SID prefix is not matched"
-    assert script.index("sc.exe showsid") < script.index("NTAccount"), (
-        "NTAccount.Translate must be the fallback, not the primary path"
-    )
-    # The SID feeds a SecurityIdentifier object, not an icacls "*SID" string -
-    # icacls cannot resolve a virtual service SID in any form.
+    assert "Translate([System.Security.Principal.SecurityIdentifier])" in script
+    assert "7038" in script, "the LSA failure must be explained in the SCM's own terms"
+    assert "REBOOT" in script, "the one known remedy must be in the error text"
+    # LSA check happens after the SID type is set and before anything is granted.
+    assert script.index("sc.exe sidtype") < script.index("$lsaSid") < script.index("Set-Acl")
+    # The SID feeds a SecurityIdentifier object, not an icacls "*SID" string.
     assert "SecurityIdentifier($serviceSid)" in script
+
+
+def test_installer_sets_the_account_at_creation_not_afterwards():
+    """Every install is a clean registration with the account in CreateService.
+
+    pywin32's --username reaches CreateService directly, so the account travels
+    with `install`. An existing service must be deleted first: pywin32 would
+    otherwise fall through to `update` and patch the account into a service
+    whose previous logon state is unknown. (The 1069 / event 7038 failure that
+    prompted this turned out to be LSA host state cleared by a reboot; see the
+    LSA check test. The clean registration is kept as the canonical form.)
+    """
+    script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "--username $ServiceAccount" in script
+    assert "--username $ServiceAccount --startup auto install" in script
+    code = "\n".join(l for l in script.splitlines() if not l.lstrip().startswith("#"))
+    assert "obj=" not in code, "the account must not be set after creation"
+    # Existing service handling precedes registration.
+    assert script.index("sc.exe delete $ServiceName") < script.index("--username $ServiceAccount")
+    assert "Get-Service -Name $ServiceName" in script
 
 
 def test_installer_sets_service_sid_type_unrestricted():
     """Without this, every ACL grant to the virtual SID is inert.
 
-    Observed on real Windows 11 ARM64: `sc.exe config obj= "NT SERVICE\\X"`
-    succeeded and `sc.exe qc` confirmed SERVICE_START_NAME, but
-    `sc.exe qsidtype` reported SERVICE_SID_TYPE: NONE. The service process then
-    never carries the virtual SID in its token, and the SID is not instantiated in
-    the local account database - which is also why LookupAccountName and
-    LookupAccountSid both failed with 1332 even for the correct "*S-1-5-80-..."
-    form. Three rounds of ACL fixes were aimed at the wrong layer.
+    CreateService leaves SERVICE_SID_TYPE at NONE, so the service process never
+    carries the virtual SID in its token. It must be set explicitly and read
+    back, before any grant.
     """
     script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
 
@@ -449,7 +467,7 @@ def test_installer_sets_service_sid_type_unrestricted():
 
 
 def test_installer_confirms_the_service_account_took_effect():
-    """A silently-ignored `sc.exe config obj=` surfaces later as a permissions failure."""
+    """A silently-ignored account surfaces later as a permissions or logon failure."""
     script = (build_dist.INSTALLER_DIR / "install.ps1").read_text()
 
     assert "sc.exe qc" in script

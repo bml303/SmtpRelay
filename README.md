@@ -680,8 +680,8 @@ Both present the **computer account** for network authentication, so NTLM/Kerber
 SMTP auth still works. `LocalService` is the one to avoid: it presents *anonymous*
 credentials on the network.
 
-`install.ps1` sets it with `sc.exe config SmtpRelay obj= "NT Service\SmtpRelay"`
-and then grants:
+`install.ps1` passes the account to pywin32's `install` (`--username`), so
+`CreateService` receives it at creation time, and then grants:
 
 | Path | Grant |
 |---|---|
@@ -691,14 +691,26 @@ and then grants:
 No write access anywhere — the service logs to the Event Log, so it never creates a
 file. Override the account with `-ServiceAccount`.
 
-Two gotchas:
+Three gotchas, all learned on a real Windows 11 ARM64 host:
 
+- **Error 1069 with System event 7038 "No mapping between account names and
+  security IDs" can be host state, not configuration.** After the first failed
+  logon of `NT SERVICE\SmtpRelay`, LSA kept answering "no mapping" for that
+  name across service deletion and re-creation, with either creation method,
+  any binary, any display name and any casing, while every fresh name resolved
+  instantly. This is also why `icacls` and `NTAccount.Translate` failed with
+  1332 for the SID, which the .NET ACL path works around. A reboot cleared it
+  and the identical registration then started fine. The installer verifies the
+  account with the same lookup the SCM performs at logon and stops with that
+  advice if it fails; `-ServiceAccount 'NT AUTHORITY\NetworkService'` is the
+  fallback if it persists.
+- The installer passes the account to `CreateService` and deletes an existing
+  service rather than letting pywin32 update it in place, so every install is a
+  clean registration with the account in the canonical position.
 - The SID must exist before it can be granted anything, so ACLs are applied
-  **after** service registration, not during the config step.
-- pywin32 does **not** grant `SeServiceLogonRight`. Virtual and built-in accounts
-  receive it automatically, but a *named* account needs it granted in `secpol.msc`
-  first, or the service fails with error 1069 ("the service did not start due to a
-  logon failure") and nothing in the message explains why.
+  **after** service registration. `SeServiceLogonRight` is held by
+  `NT SERVICE\ALL SERVICES` in the default policy; only a *named* account needs
+  it granted explicitly.
 
 ### Operational notes
 

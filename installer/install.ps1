@@ -106,6 +106,31 @@ if ((Test-Path $InstallDir) -and -not $Force) {
     Stop-WithError "'$InstallDir' already exists." "Re-run with -Force to replace it."
 }
 
+# An existing service must be deleted and re-created, never updated in place.
+# pywin32's `install` falls through to `update` (ChangeServiceConfig) when the
+# service exists, and an account set that way is what breaks virtual-account
+# logon - see the registration step for the full story.
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($existingService) {
+    if (-not $Force) {
+        Stop-WithError "Service '$ServiceName' is already registered." `
+            "Run uninstall.ps1 first, or re-run with -Force to replace it."
+    }
+    if ($existingService.Status -ne 'Stopped') {
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    }
+    & sc.exe delete $ServiceName | Out-Null
+    $deadline = (Get-Date).AddSeconds(15)
+    while (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -gt $deadline) {
+            Stop-WithError "Service '$ServiceName' is still registered after 'sc.exe delete'." `
+                "Close services.msc and any 'sc.exe query' windows (they hold the service open), then re-run."
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Ok "Removed the existing service registration"
+}
+
 # ------------------------------------------------------------------ install
 
 Write-Step "Preparing $InstallDir"
@@ -189,9 +214,28 @@ Write-Ok "ACLs applied after service registration"
 # ------------------------------------------------------------------ service
 
 Write-Step "Registering service '$ServiceName'"
+
+# The account is passed to CreateService here (pywin32's --username goes
+# straight through), which is the canonical form, rather than patched in
+# afterwards with `sc.exe config obj=`. --startup auto replaces a later
+# `sc.exe config start=`.
+#
+# What actually went wrong on a Windows 11 build 28000 ARM64 host, so nobody
+# re-diagnoses it: after the first failed logon of NT SERVICE\<name>, LSA kept
+# answering 1332 ERROR_NONE_MAPPED for that *name* - across service deletion
+# and re-creation, with either creation method, any binary, any display name
+# and any casing - while every fresh name resolved instantly. The SCM then
+# fails every start with 1069 and System event 7038 "No mapping between account
+# names and security IDs". It is in-memory state: a reboot cleared it and the
+# same registration then started fine. The LSA check in the permissions step
+# turns this into an installer error with that advice, instead of a service
+# that cannot start.
+#
+# A virtual service account takes no password. "Log on as a service" is held by
+# NT SERVICE\ALL SERVICES in the default policy, so nothing has to be granted.
 Push-Location $InstallDir
 try {
-    & $Python -m app.windows_service install
+    & $Python -m app.windows_service --username $ServiceAccount --startup auto install
     $installExit = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -203,7 +247,6 @@ if ($installExit -ne 0) {
 }
 Write-Ok "Service registered"
 
-& sc.exe config $ServiceName start= auto | Out-Null
 & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
 Write-Ok "Start type: automatic; restart on failure enabled"
 
@@ -211,25 +254,11 @@ Write-Ok "Start type: automatic; restart on failure enabled"
 
 Write-Step "Applying least-privilege permissions"
 
-# A virtual service account needs no password, and the SCM grants it
-# SeServiceLogonRight automatically. A *named* account would additionally need
-# that right granted in secpol.msc, or the service fails to start with error
-# 1069 ("The service did not start due to a logon failure") - pywin32 does not
-# grant it for you.
-& sc.exe config $ServiceName obj= $ServiceAccount | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Stop-WithError "sc.exe could not set the account to '$ServiceAccount' (exit $LASTEXITCODE)." `
-        "Re-run with -ServiceAccount 'NT AUTHORITY\NetworkService' to fall back."
-}
-Write-Ok "Service account: $ServiceAccount"
+Write-Ok "Service account: $ServiceAccount (set at creation)"
 
-# CRITICAL, and easy to miss: setting obj= alone leaves SERVICE_SID_TYPE at NONE,
-# which means the service process never receives the virtual SID in its token.
-# Every ACL grant to that SID is then inert, and the SID is not instantiated in
-# the local account database - so LookupAccountName/LookupAccountSid cannot
-# resolve it either, which is how icacls comes back with 1332 ERROR_NONE_MAPPED
-# even for the correct "*S-1-5-80-..." form. Observed on a real Windows 11 ARM64
-# host: `sc.exe qsidtype` reported NONE after a successful obj= change.
+# CreateService leaves SERVICE_SID_TYPE at NONE, which means the service process
+# never receives the virtual SID in its token and every ACL grant to that SID is
+# inert. Set it before granting anything, and read it back.
 & sc.exe sidtype $ServiceName unrestricted | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Stop-WithError "sc.exe could not set SERVICE_SID_TYPE to unrestricted (exit $LASTEXITCODE)." `
@@ -258,32 +287,39 @@ if ($qsid -match '(?m)^\s*SERVICE_SID_TYPE\s*:\s*(.+)$') {
     Write-Warn2 "Could not read SERVICE_SID_TYPE from 'sc.exe qsidtype' (localized output?)."
 }
 
-# Resolve the account to a SID with `sc.exe showsid`, NOT by name lookup.
-# "NT SERVICE\<name>" is not resolvable through LookupAccountName, so both
-# NTAccount.Translate and icacls-by-name fail with 1332 ERROR_NONE_MAPPED even
-# when sc.exe accepted the account and the service exists - confirmed on a real
-# Windows 11 ARM64 host. showsid computes the virtual-account SID directly.
-# Match on the SID token only, so localized sc.exe output does not matter.
+# Resolve the account to a SID. For the virtual account `sc.exe showsid`
+# computes it directly from the service name (match on the SID token only, so
+# localized output does not matter). Any other account - e.g. -ServiceAccount
+# 'NT AUTHORITY\NetworkService' - goes through name lookup; showsid would return
+# the virtual SID for it, which is the wrong principal to grant.
+$isVirtualAccount = $ServiceAccount -match '^NT SERVICE\\'
 $serviceSid = $null
-$showsid = (& sc.exe showsid $ServiceName) -join "`n"
-if ($showsid -match 'S-1-5-80-[0-9-]+') {
-    $serviceSid = $Matches[0]
+if ($isVirtualAccount) {
+    $showsid = (& sc.exe showsid $ServiceName) -join "`n"
+    if ($showsid -match 'S-1-5-80-[0-9-]+') { $serviceSid = $Matches[0] }
 }
 
-if (-not $serviceSid) {
-    try {
-        $ntAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
-        $serviceSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        $serviceSid = $null
-    }
+# LSA must agree, whatever the account. This is the same lookup the SCM performs
+# at logon: if it fails here, the service would fail to start with 1069 and
+# System event 7038 "No mapping between account names and security IDs", and
+# every ACL grant below would be aimed at a principal that cannot log on.
+try {
+    $ntAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
+    $lsaSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+} catch {
+    Stop-WithError "LSA cannot resolve '$ServiceAccount' (the SCM would fail the logon with 1069 / event 7038)." `
+        ("The service was created with that account, so this is host state, not the installer. " +
+         "Seen once after a failed logon of the same name: LSA kept answering 'no mapping' for it " +
+         "until a REBOOT. Reboot and re-run this installer with -Force. " +
+         "If it persists, re-run with -ServiceAccount 'NT AUTHORITY\NetworkService'.")
 }
-
 if (-not $serviceSid) {
-    Stop-WithError "Could not resolve a SID for '$ServiceAccount'." `
-        "Get it manually with: sc.exe showsid $ServiceName"
+    $serviceSid = $lsaSid
+} elseif ($serviceSid -ne $lsaSid) {
+    Stop-WithError "sc.exe showsid ($serviceSid) and LSA ($lsaSid) disagree about '$ServiceAccount'." `
+        "The service name and the account name must match exactly."
 }
-Write-Ok "$ServiceAccount -> $serviceSid"
+Write-Ok "$ServiceAccount -> $serviceSid (confirmed by LSA)"
 
 # icacls CANNOT be used for a virtual service account. Even the documented
 # "*S-1-5-80-..." numeric form fails with 1332 ERROR_NONE_MAPPED, because icacls
