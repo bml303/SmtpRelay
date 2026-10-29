@@ -1,6 +1,6 @@
 [project]
 name = "smtp-relay"
-version = "0.3.0"
+version = "0.3.1"
 description = "REST-to-SMTP relay: validates JSON against a schema, allowlists recipient domains, and delivers via a configurable mailhost over STARTTLS or implicit TLS."
 readme = "README.md"
 requires-python = ">=3.11"
