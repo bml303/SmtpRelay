@@ -25,7 +25,9 @@
     unless -PfxPassword is given; it is used once and never stored.
 
 .PARAMETER PfxPassword
-    SecureString passphrase for -PfxPath. Omit to be prompted.
+    SecureString passphrase for -PfxPath. Omit to be prompted. Only usable when
+    the script runs in the current session; `powershell -File` passes arguments
+    as text, so a SecureString cannot cross that boundary - use the prompt.
 
 .PARAMETER CertThumbprint
     Use a certificate that is already in Cert:\LocalMachine\My instead of

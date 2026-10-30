@@ -700,7 +700,10 @@ ends up depending on one user's profile.
 Switches: `-InstallDir`, `-ConfigDir`, `-ServiceName`, `-ServiceAccount`,
 `-ApiPort`, `-OpenFirewall`, `-Start`, `-Force`, and for the API certificate
 `-PfxPath` (+ optional `-PfxPassword` SecureString) or `-CertThumbprint` — see
-[Certificate sources](#certificate-sources). `uninstall.ps1` leaves the
+[Certificate sources](#certificate-sources). `-PfxPassword` can only be passed
+when the script runs in the current session (`.\install.ps1 ...` after
+`Set-ExecutionPolicy -Scope Process Bypass`); through `powershell -File` every
+argument arrives as text, so leave it out there and answer the prompt instead. `uninstall.ps1` leaves the
 certificate in the store; remove it in `certlm.msc` if it is no longer wanted.
 
 `uninstall.ps1` stops and removes the service, deletes the install directory and
