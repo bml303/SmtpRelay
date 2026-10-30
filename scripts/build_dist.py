@@ -602,9 +602,13 @@ def verify_dependency_closure(
 
 
 def installer_files(target: Target) -> list[Path]:
+    """The scripts plus the per-platform README.txt that lands in the payload root."""
     if target.family == "windows":
-        return sorted(WINDOWS_INSTALLER_DIR.glob("*.ps1"))
-    return sorted(LINUX_INSTALLER_DIR.glob("*.sh")) + [LINUX_INSTALLER_DIR / "smtp-relay.service"]
+        return sorted(WINDOWS_INSTALLER_DIR.glob("*.ps1")) + [WINDOWS_INSTALLER_DIR / "README.txt"]
+    return (
+        sorted(LINUX_INSTALLER_DIR.glob("*.sh"))
+        + [LINUX_INSTALLER_DIR / "smtp-relay.service", LINUX_INSTALLER_DIR / "README.txt"]
+    )
 
 
 def stage_source(payload: Path, platform: str = "win_arm64") -> None:

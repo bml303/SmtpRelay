@@ -1062,10 +1062,12 @@ installer/
   windows/
     install.ps1       offline installer: runtime, wheels, config, service, ACLs
     uninstall.ps1
+    README.txt        operator instructions shipped in the payload root
   linux/
     install.sh        offline installer: runtime, wheels, config, systemd unit
     uninstall.sh
     smtp-relay.service  hardened unit template rendered by install.sh
+    README.txt        operator instructions shipped in the payload root
 docker/
   healthcheck.py      container HEALTHCHECK: GET /health via the configured scheme
 Dockerfile            multi-arch (amd64/arm64) image, unprivileged, no secrets baked in

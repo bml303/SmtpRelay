@@ -301,11 +301,40 @@ def test_project_version_sources_currently_agree():
 
 
 def test_installer_scripts_are_present():
-    windows = sorted(p.name for p in build_dist.WINDOWS_INSTALLER_DIR.glob("*.ps1"))
+    windows = sorted(p.name for p in build_dist.WINDOWS_INSTALLER_DIR.iterdir())
     linux = sorted(p.name for p in build_dist.LINUX_INSTALLER_DIR.iterdir())
 
-    assert windows == ["install.ps1", "uninstall.ps1"]
-    assert linux == ["install.sh", "smtp-relay.service", "uninstall.sh"]
+    assert windows == ["README.txt", "install.ps1", "uninstall.ps1"]
+    assert linux == ["README.txt", "install.sh", "smtp-relay.service", "uninstall.sh"]
+
+
+@pytest.mark.parametrize("platform", ["win_arm64", "linux_x86_64"])
+def test_every_installer_file_is_staged_into_the_payload_root(tmp_path, platform):
+    files = build_dist.installer_files(build_dist.target_for(platform))
+
+    assert all(f.is_file() for f in files), files
+    assert "README.txt" in {f.name for f in files}
+
+
+@pytest.mark.parametrize(
+    ("readme", "uninstaller"),
+    [
+        (build_dist.WINDOWS_INSTALLER_DIR / "README.txt", "uninstall.ps1"),
+        (build_dist.LINUX_INSTALLER_DIR / "README.txt", "uninstall.sh"),
+    ],
+)
+def test_payload_readme_covers_install_check_and_uninstall(readme, uninstaller):
+    """The README.txt is what an operator without the repository sees first."""
+    text = readme.read_text()
+
+    for heading in ("Install", "Configure", "Check before starting", "Upgrade", "Uninstall", "Logs"):
+        assert f"\n{heading}\n" in text, f"{readme.name} lacks a '{heading}' section"
+    assert "-m app --check" in text
+    assert "NOTHING IS SENT" in text
+    assert uninstaller in text
+    # Plain text for Notepad and less alike: ASCII only, no line beyond 80 columns.
+    assert text.isascii()
+    assert max(len(line) for line in text.splitlines()) <= 120
 
 
 def test_targets_cover_both_families_and_archive_kinds():
