@@ -17,6 +17,7 @@ Contents
   MANIFEST.json        version, platform, file hashes; checked by install
   SBOM.cdx.json        CycloneDX software bill of materials
   README.md            full project documentation (Markdown)
+  LICENSE              MIT
 
 Before you start
 ----------------

@@ -731,7 +731,7 @@ wheels/                every dependency as a target-platform wheel
 install.ps1            offline installer (elevated)
 uninstall.ps1
 config.example.toml    template - the developer's config.toml is never staged
-pyproject.toml, requirements.txt, README.md
+pyproject.toml, requirements.txt, README.md, LICENSE
 MANIFEST.json          version, runtime_version, target, per-file sha256, payload digest
 ```
 

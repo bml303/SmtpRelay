@@ -114,7 +114,7 @@ PBS_RELEASE_ENV = "PBS_RELEASE"
 
 #: Staged into the payload. Deliberately an allowlist: config.toml is excluded
 #: because the developer's copy may hold a real SMTP password or API token.
-SOURCE_FILES = ["pyproject.toml", "README.md", "config.example.toml", "requirements.txt"]
+SOURCE_FILES = ["pyproject.toml", "README.md", "LICENSE", "config.example.toml", "requirements.txt"]
 SOURCE_DIRS = ["app"]
 
 #: Runtime directory name inside the payload and under the install prefix.
