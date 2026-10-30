@@ -707,7 +707,10 @@ produces a `.zip` for Windows targets and a `.tar.gz` for Linux ones, the latter
 because it preserves executable bits.
 
 The wheel tag is **derived** from `--runtime-version` rather than specified
-separately, so the wheels cannot disagree with the bundled interpreter.
+separately, so the wheels cannot disagree with the bundled interpreter. The
+script itself needs only `pip` and the `packaging` distribution on the build
+host (part of the dev extras); PowerShell, if present, is used to parse-check
+the Windows installer.
 
 **Each build bumps the patch version** — `0.1.0` → `0.1.1` — in both
 `pyproject.toml` and `app/__init__.py`, so no two payloads ever share a filename.

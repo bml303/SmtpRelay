@@ -29,6 +29,9 @@ dev = [
     "httpx>=0.27",
     # Real SMTP sink used by tests/test_integration.py.
     "aiosmtpd>=1.4.6",
+    # scripts/build_dist.py evaluates environment markers and parses
+    # Requires-Dist when selecting and verifying the wheels for a target.
+    "packaging>=24",
 ]
 # Native Windows service support (app/windows_service.py). The marker keeps
 # this a no-op on Linux/macOS, so `pip install '.[dev,windows]'` is safe anywhere.

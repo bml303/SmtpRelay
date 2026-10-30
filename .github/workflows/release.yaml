@@ -60,6 +60,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install build requirements
+        # build_dist.py needs `packaging` (markers, Requires-Dist); a bare
+        # runner has only pip.
+        run: python -m pip install packaging
 
       - name: PowerShell is available
         # build_dist.py syntax-checks install.ps1/uninstall.ps1 with the real
