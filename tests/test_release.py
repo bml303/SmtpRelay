@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-import publish_release as pr
+import release as pr
 
 
 @pytest.mark.parametrize(
@@ -35,24 +35,6 @@ def test_check_version_requires_agreement(tmp_path):
     with pytest.raises(pr.ReleaseError) as excinfo:
         pr.check_version("v0.3.0", pyproject)
     assert "0.3.0" in str(excinfo.value) and "0.2.0" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    "url, slug",
-    [
-        ("git@gitea.example.org:beat/SmtpRelay.git", "beat/SmtpRelay"),
-        ("https://gitea.example.org/beat/SmtpRelay.git", "beat/SmtpRelay"),
-        ("https://gitea.example.org/beat/SmtpRelay", "beat/SmtpRelay"),
-        ("ssh://git@gitea.example.org:2222/beat/SmtpRelay.git", "beat/SmtpRelay"),
-    ],
-)
-def test_repo_slug_from_remote_url(url, slug):
-    assert pr.repo_slug_from_url(url) == slug
-
-
-def test_split_repo_rejects_non_slugs():
-    with pytest.raises(pr.ReleaseError):
-        pr.split_repo("just-a-name")
 
 
 def _git(repo: Path, *args: str) -> None:

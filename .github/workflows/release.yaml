@@ -1,30 +1,30 @@
 # Release pipeline: runs on every `vX.Y.Z` tag.
 #
 #   tests  ->  payloads  (Windows zips, Linux tarballs, one CycloneDX SBOM per payload,
-#                         SHA256SUMS, attached to the release)
-#          ->  image     (multi-arch container pushed to this Gitea's registry as
-#                         <owner>/smtprelay:vX.Y.Z, plus a syft SBOM per architecture
-#                         attached to the same release)
+#                         SHA256SUMS, attached to the GitHub release)
+#          ->  image     (multi-arch container pushed to ghcr.io/<owner>/smtprelay:vX.Y.Z,
+#                         plus a syft SBOM per architecture attached to the same release)
 #
 # The tag is the source of truth. If it does not match pyproject.toml the run
 # fails before downloading anything, so an artefact can never carry a version
-# its own /health endpoint denies.
+# its own /health endpoint denies. Release notes are the annotated tag's
+# message (scripts/release.py notes). A pre-release tag (vX.Y.Z-rc.1) is
+# published as a GitHub pre-release and never moves the `latest` image tag.
 #
-# Runner requirements (see "Releasing" in the README):
-#   - a runner with the `ubuntu-latest` label;
-#   - for the `image` job, that runner must be able to run `docker` (a host-mode
-#     runner, or the Docker socket mounted into the job container).
-# The automatic GITHUB_TOKEN can create releases and upload assets, but on this
-# instance it cannot log in to the container registry (401 on the first real
-# run). Add a `REGISTRY_TOKEN` repository secret - a personal access token with
-# write:package only - which the registry login uses; releases and assets keep
-# using GITHUB_TOKEN, so the secret never needs repository scope.
+# Every step is idempotent: re-running a failed job updates the release and
+# replaces assets of the same name instead of duplicating them. The automatic
+# token is enough for everything - releases need `contents: write`, the
+# registry `packages: write` - so the repository needs no secrets at all.
 
 name: release
 
 on:
   push:
     tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
 
 env:
   PYTHON_VERSION: "3.14"
@@ -40,7 +40,7 @@ jobs:
       - name: Install
         run: python -m pip install -e '.[dev]'
       - name: Tag must match pyproject.toml
-        run: python scripts/publish_release.py check-version --tag "$GITHUB_REF_NAME"
+        run: python scripts/release.py check-version --tag "$GITHUB_REF_NAME"
       - name: Test
         run: python -m pytest
 
@@ -50,24 +50,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # release_notes() reads the tag annotation and the previous tag.
+          # release.py notes reads the tag annotation and the previous tag.
           fetch-depth: 0
+      - name: Fetch the annotated tag object
+        # actions/checkout resolves the ref to its commit and leaves a
+        # lightweight tag behind; the annotation (the release notes) is only
+        # there after fetching the tag object itself.
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install PowerShell
+      - name: PowerShell is available
         # build_dist.py syntax-checks install.ps1/uninstall.ps1 with the real
         # PowerShell parser; without pwsh it only warns, and a parse error
-        # would then reach the target machine.
-        run: |
-          set -euo pipefail
-          . /etc/os-release
-          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/msprod.deb
-          sudo dpkg -i /tmp/msprod.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq powershell
-          pwsh -NoLogo -Command '$PSVersionTable.PSVersion.ToString()'
+        # would then reach the target machine. GitHub's Ubuntu runners ship it.
+        run: pwsh -NoLogo -Command '$PSVersionTable.PSVersion.ToString()'
 
       - name: Build win_amd64 payload
         run: python scripts/build_dist.py --no-bump --platform win_amd64 --zip
@@ -85,44 +83,47 @@ jobs:
           cd dist
           sha256sum SmtpRelay-*.zip SmtpRelay-*.tar.gz SmtpRelay-*.cdx.json | tee SHA256SUMS
 
-      - name: Publish release
+      - name: Create or update the release
         env:
-          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python scripts/publish_release.py publish \
-            --tag "$GITHUB_REF_NAME" \
-            --server "$GITHUB_SERVER_URL" \
-            --repo "$GITHUB_REPOSITORY" \
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          title="SMTP Relay $version"
+          python scripts/release.py notes --tag "$tag" > dist/NOTES.md
+          prerelease=()
+          case "$version" in *-*) prerelease=(--prerelease) ;; esac
+          if gh release view "$tag" --json id >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes-file dist/NOTES.md "${prerelease[@]}"
+          else
+            gh release create "$tag" --verify-tag --title "$title" --notes-file dist/NOTES.md "${prerelease[@]}"
+          fi
+          gh release upload "$tag" --clobber \
             dist/SmtpRelay-*.zip dist/SmtpRelay-*.tar.gz dist/SmtpRelay-*.cdx.json dist/SHA256SUMS
 
   image:
-    # After payloads as well: both jobs publish to the same release, and the
-    # publisher creates it if missing, so serialising avoids a create/create race.
+    # After payloads: both jobs touch the same release, and only the payloads
+    # job creates it, so the SHA256SUMS fold below always finds it.
     needs: [tests, payloads]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Image coordinates
-        # Image references must be lowercase; the repository slug is not.
+        # Image references must be lowercase; the repository owner may not be.
         run: |
           set -euo pipefail
-          registry="${GITHUB_SERVER_URL#https://}"
-          registry="${registry#http://}"
           owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/$owner/smtprelay"
           version="${GITHUB_REF_NAME#v}"
           # A pre-release (vX.Y.Z-rc.1) must never move the `latest` tag.
           case "$version" in
-            *-*) tags="$registry/$owner/smtprelay:v$version" ;;
-            *)   tags="$registry/$owner/smtprelay:v$version"$'\n'"$registry/$owner/smtprelay:latest" ;;
+            *-*) tags="$image:v$version" ;;
+            *)   tags="$image:v$version"$'\n'"$image:latest" ;;
           esac
           {
-            echo "REGISTRY=$registry"
-            echo "IMAGE=$registry/$owner/smtprelay"
+            echo "IMAGE=$image"
             echo "VERSION=$version"
             echo "IMAGE_TAGS<<EOF"
             echo "$tags"
@@ -133,9 +134,9 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -149,6 +150,7 @@ jobs:
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
 
       - name: Image SBOMs (syft, one per architecture)
         # The payload SBOMs come from build_dist.py, which knows every wheel it
@@ -169,19 +171,11 @@ jobs:
         # SHA256SUMS was written by the payloads job before these files existed;
         # fetch it from the release, append the image SBOM lines, and replace it.
         env:
-          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
-          sums_url=$(curl -sSf -H "Authorization: token $GITEA_TOKEN" \
-            "$api/releases/tags/$GITHUB_REF_NAME" | python -c \
-            'import json,sys; print(next(a["browser_download_url"] for a in json.load(sys.stdin)["assets"] if a["name"]=="SHA256SUMS"))')
-          curl -sSf -H "Authorization: token $GITEA_TOKEN" -o dist/SHA256SUMS "$sums_url"
+          gh release download "$GITHUB_REF_NAME" --pattern SHA256SUMS --dir dist --clobber
           grep -v -- '-image-' dist/SHA256SUMS > dist/SHA256SUMS.new
           (cd dist && sha256sum SmtpRelay-*-image-*.cdx.json) >> dist/SHA256SUMS.new
           mv dist/SHA256SUMS.new dist/SHA256SUMS
-          python scripts/publish_release.py publish \
-            --tag "$GITHUB_REF_NAME" \
-            --server "$GITHUB_SERVER_URL" \
-            --repo "$GITHUB_REPOSITORY" \
-            dist/SmtpRelay-*-image-*.cdx.json dist/SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --clobber dist/SmtpRelay-*-image-*.cdx.json dist/SHA256SUMS

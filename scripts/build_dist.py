@@ -121,10 +121,11 @@ SOURCE_DIRS = ["app"]
 RUNTIME_DIRNAME = "python"
 
 #: Needed to build the project's own wheel offline, and as the pip bootstrap
-#: fallback if ensurepip misbehaves. Not `wheel`: setuptools >= 70.1 builds
+#: fallback if ensurepip misbehaves. >= 77 for PEP 639 license metadata in
+#: pyproject.toml. Not `wheel`: setuptools >= 70.1 builds
 #: wheels itself, and the wheel package would drag in `packaging`, which nothing
 #: at runtime needs.
-BUILD_BACKEND_PACKAGES = ["pip", "setuptools>=70.1"]
+BUILD_BACKEND_PACKAGES = ["pip", "setuptools>=77"]
 
 DEFAULT_RUNTIME_VERSION = "3.15.2"
 

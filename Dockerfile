@@ -39,6 +39,8 @@ FROM docker.io/library/python:${PYTHON_VERSION}-slim
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="smtp-relay" \
       org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/bml303/SmtpRelay" \
+      org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.description="REST-to-SMTP relay: JSON in, allowlisted mail out through a configured mailhost."
 
 # Dedicated unprivileged account. /etc/smtp-relay is the POSIX config location

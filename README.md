@@ -487,11 +487,11 @@ looks like; see History below.
 
 ## Running in Docker
 
-Published images live in this Gitea's container registry, one multi-arch
+Published images live in the GitHub Container Registry, one multi-arch
 manifest per release covering `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull gitea.softbase.tech/beat/smtprelay:v0.2.2
+docker pull ghcr.io/bml303/smtprelay:v0.3.3
 ```
 
 Image names must be lowercase, hence `smtprelay` for the `SmtpRelay` repository.
@@ -793,56 +793,41 @@ containing a `._pth` file, and asserts `ensurepip` is present.
 ### Releasing
 
 Payloads are **not** committed; each is about 32 MB and git would keep every one
-forever. A release is a tag plus attachments on the Gitea release page, and the
-container image goes to this Gitea's package registry.
+forever. A release is a tag plus attachments on the
+[GitHub release](https://github.com/bml303/SmtpRelay/releases), and the
+container image goes to `ghcr.io/bml303/smtprelay`.
 
 The tag is the source of truth. `vX.Y.Z` must match `version` in
 `pyproject.toml`, otherwise the pipeline stops before downloading anything:
 
 ```bash
-.venv/bin/python scripts/build_dist.py --version 0.3.0 --no-bump --platform win_arm64 --zip   # sets the version
-git commit -am "Release 0.3.0" && git tag -a --cleanup=verbatim v0.3.0 -F notes.md && git push origin main v0.3.0
+.venv/bin/python -c "import sys; sys.path.insert(0, 'scripts'); import build_dist; build_dist.write_version('0.3.3')"
+git commit -am "Release 0.3.3" && git tag -a --cleanup=verbatim v0.3.3 -F notes.md && git push origin main v0.3.3
 ```
 
-`.gitea/workflows/release.yaml` then runs the tests, builds the two Windows and
-two Linux payloads with the installer checks enabled, writes `SHA256SUMS`, creates or updates
-the release with the assets attached, and builds and pushes the multi-arch image
-as `gitea.softbase.tech/<owner>/smtprelay:vX.Y.Z` and `:latest`. Release notes
-are the annotated tag's message; a lightweight tag falls back to the commit
-subjects since the previous tag. Tag with `--cleanup=verbatim`, otherwise git
-strips every line starting with `#`, which is every Markdown heading. Every step is idempotent, so re-running a failed
-job converges rather than producing duplicate assets.
+`.github/workflows/release.yaml` then runs the tests, builds the two Windows and
+two Linux payloads with the installer checks enabled, writes `SHA256SUMS`,
+creates or updates the release with the assets attached (`gh release`), and
+builds and pushes the multi-arch image as `ghcr.io/<owner>/smtprelay:vX.Y.Z`
+and `:latest`. Release notes are the annotated tag's message; a lightweight tag
+falls back to the commit subjects since the previous tag. Tag with
+`--cleanup=verbatim`, otherwise git strips every line starting with `#`, which
+is every Markdown heading. A pre-release tag such as `v0.3.2-rc.1` is published
+as a GitHub pre-release and never moves the `latest` image tag. Every step is
+idempotent, so re-running a failed job converges rather than producing
+duplicate assets.
 
-Two runner requirements: a runner with the `ubuntu-latest` label must be
-registered for the repository, the owner, or the instance, and the `image` job
-needs that runner to be able to run `docker` with privileges (buildx and QEMU
-for the arm64 half). `.gitea/runner/compose.yaml` is a ready-to-run runner with
-exactly that setup; its header has the three commands, and it works with Docker
-or rootless Podman. Registering it needs a registration token from the
-repository's Actions settings, which is deliberately a human step. The
-automatic `GITHUB_TOKEN` can create releases and upload assets, but it cannot
-log in to this Gitea's container registry, so the `image` job needs a
-`REGISTRY_TOKEN` repository secret: a personal access token with only the
-`write:package` scope. The secret is used for the registry login alone;
-releases and their assets are still published with `GITHUB_TOKEN`. The
-project's own runner lives rootful inside a
-`podman machine` VM; the compose header shows that invocation too.
-Until a runner exists, releases are published by hand as described below, and
-the workflow's first run can be verified with a pre-release tag such as
-`v0.3.2-rc.1`, which the publisher marks as a pre-release automatically.
+The workflow needs no secrets: the automatic token creates the release
+(`contents: write`) and pushes the image (`packages: write`). The first image
+push creates the package as private; make it public once under the package's
+settings on GitHub, and it stays public for every later release. GitHub's
+hosted Ubuntu runners have PowerShell, `systemd-analyze` and Docker with QEMU,
+so the arm64 half of the image is cross-built there.
 
-The same publisher works by hand, which is how 0.2.0 was released:
-
-```bash
-.venv/bin/python scripts/build_dist.py --no-bump --platform win_amd64 --zip
-.venv/bin/python scripts/build_dist.py --no-bump --platform win_arm64 --zip
-(cd dist && sha256sum SmtpRelay-0.3.0-*.zip > SHA256SUMS)
-GITEA_TOKEN=... .venv/bin/python scripts/publish_release.py publish --tag v0.3.0 \
-    dist/SmtpRelay-0.3.0-*.zip dist/SHA256SUMS
-```
-
-`publish_release.py check-version --tag vX.Y.Z` and `notes --tag vX.Y.Z` show
-what the pipeline would do without touching the server.
+`scripts/release.py check-version --tag vX.Y.Z` and `notes --tag vX.Y.Z` show
+what the pipeline would do without touching GitHub. Releases 0.2.0 to 0.3.3 were
+published on a self-hosted Gitea with the same pipeline on Gitea Actions; the
+repository moved to GitHub after 0.3.3.
 
 ### Software bill of materials
 
@@ -1052,12 +1037,10 @@ tests/
 scripts/
   build_dist.py       cross-builds the offline payloads (Windows and Linux)
   test_linux_installer.sh  end-to-end install/upgrade/uninstall in a systemd container
-  publish_release.py  creates the Gitea release for a tag and attaches the payloads
-.gitea/workflows/
-  release.yaml        on a vX.Y.Z tag: tests, four payloads + SBOMs, release, multi-arch image
-.gitea/runner/
-  compose.yaml        a Gitea Actions runner for this repo (Docker or rootless Podman)
-  config.yaml
+  release.py          tag/version agreement and release notes for the workflow
+.github/workflows/
+  release.yaml        on a vX.Y.Z tag: tests, four payloads + SBOMs, GitHub release, ghcr.io image
+LICENSE               MIT
 installer/
   windows/
     install.ps1       offline installer: runtime, wheels, config, service, ACLs

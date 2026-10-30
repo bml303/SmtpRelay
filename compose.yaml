@@ -13,7 +13,7 @@ services:
   smtp-relay:
     # Pull the published multi-arch image, or drop `image:` in favour of
     # `build: {context: .}` to build from this checkout.
-    image: gitea.softbase.tech/beat/smtprelay:v0.2.2
+    image: ghcr.io/bml303/smtprelay:v0.3.3
     ports:
       # Publish on loopback only: the proxy connects locally, nothing else should.
       # Behind an ingress on a private network, drop the 127.0.0.1 prefix.
