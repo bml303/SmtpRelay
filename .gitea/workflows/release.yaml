@@ -17,7 +17,8 @@
 # The automatic GITHUB_TOKEN can create releases and upload assets, but on this
 # instance it cannot log in to the container registry (401 on the first real
 # run). Add a `REGISTRY_TOKEN` repository secret - a personal access token with
-# write:package - and both the registry login and the publisher use it.
+# write:package only - which the registry login uses; releases and assets keep
+# using GITHUB_TOKEN, so the secret never needs repository scope.
 
 name: release
 
@@ -86,7 +87,7 @@ jobs:
 
       - name: Publish release
         env:
-          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           python scripts/publish_release.py publish \
@@ -168,7 +169,7 @@ jobs:
         # SHA256SUMS was written by the payloads job before these files existed;
         # fetch it from the release, append the image SBOM lines, and replace it.
         env:
-          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"

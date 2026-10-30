@@ -680,8 +680,10 @@ or rootless Podman. Registering it needs a registration token from the
 repository's Actions settings, which is deliberately a human step. The
 automatic `GITHUB_TOKEN` can create releases and upload assets, but it cannot
 log in to this Gitea's container registry, so the `image` job needs a
-`REGISTRY_TOKEN` repository secret: a personal access token with the
-`write:package` scope. The project's own runner lives rootful inside a
+`REGISTRY_TOKEN` repository secret: a personal access token with only the
+`write:package` scope. The secret is used for the registry login alone;
+releases and their assets are still published with `GITHUB_TOKEN`. The
+project's own runner lives rootful inside a
 `podman machine` VM; the compose header shows that invocation too.
 Until a runner exists, releases are published by hand as described below, and
 the workflow's first run can be verified with a pre-release tag such as
