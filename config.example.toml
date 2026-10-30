@@ -64,6 +64,8 @@ host = "mail.example.com"
 port = 587
 # "starttls" | "tls" | "none". Omit to infer from the port above.
 # security = "starttls"
+# Both username and password, or neither: the relay authenticates only when a
+# username is set, and refuses to start with a password alone.
 # username = "relay@example.com"
 # Password: use RELAY_SMTP_PASSWORD rather than this file.
 # password = ""

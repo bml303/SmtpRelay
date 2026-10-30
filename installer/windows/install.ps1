@@ -666,10 +666,13 @@ Installation complete.
 
 Next steps:
   1. Edit the configuration:   notepad "$configFile"
-  2. Verify config discovery:  & '$Python' -c "from app.config import _candidate_paths; [print(p) for p in _candidate_paths(None)[0]]"
+  2. Check it (nothing sent):  & '$Python' -m app --check
   3. Console test run:         & '$Python' -m app.windows_service debug
   4. Start the service:        & '$Python' -m app.windows_service start
   5. Read the logs:            Get-EventLog -LogName Application -Source SmtpRelay -Newest 20
+
+The check loads the certificate, holds a dry SMTP session with the mailhost
+(TLS, AUTH, MAIL FROM, then QUIT) and prints which config file it read.
 
 No system Python is used or required: the runtime lives in $RuntimeDir and is
 private to this service.

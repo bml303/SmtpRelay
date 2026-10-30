@@ -13,6 +13,7 @@ whether the mailhost actually accepted the message.
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 cp config.example.toml config.toml      # then edit host/port/sender/allowlist
+.venv/bin/python -m app --check         # dry run against the mailhost, nothing sent
 .venv/bin/python -m app
 ```
 
@@ -164,7 +165,66 @@ annotated template.
 
 Unknown keys and sections are rejected at startup, so a typo fails immediately
 rather than being ignored. Bad configuration exits with code 2 and a message naming
-the offending field.
+the offending field. A password without a username is one such error: the relay
+only authenticates when `smtp.username` is set, so a lone `smtp.password` would be
+ignored silently and the mailhost would refuse every message.
+
+### Checking the configuration
+
+Validation catches what the values alone reveal. `--check` tests the rest against
+the real world, then exits without serving:
+
+```bash
+.venv/bin/python -m app --check              # --no-smtp: skip the mailhost
+```
+
+```
+smtp-relay 0.3.2 configuration check
+  ok    config        /etc/smtp-relay/config.toml (overridden from the environment: RELAY_SMTP_PASSWORD)
+  ok    api           https://0.0.0.0:8000, reachable from the network, TLS served by this process, clients authenticate with client certificate (mutual TLS)
+  ok    api.tls       PKCS#12 file /etc/smtp-relay/relay.pfx: subject CN=relay.example.com, thumbprint 52B4..., valid for 364 more days (until 2027-10-29T09:12:00+00:00); client certificates required, 1 CA certificate(s) loaded from /etc/smtp-relay/client-ca.pem
+  ok    policy        sender relay@example.com; recipients allowed at example.com, example.org
+  ok    smtp.dns      smtp.example.com resolves to 192.0.2.25
+  ok    smtp.session  connected to smtp.example.com:587 over STARTTLS, TLSv1.3 TLS_AES_256_GCM_SHA384, server certificate verified; offers AUTH PLAIN LOGIN, SIZE 28311552
+  ok    smtp.auth     authenticated as relay@example.com
+  ok    smtp.sender   smtp.example.com:587 accepts MAIL FROM:<relay@example.com>
+Result: 8 ok, 0 warning(s), 0 failed
+```
+
+The probes, in order: where the configuration came from and which `RELAY_*`
+variables override it; what the API binds and how clients must authenticate;
+the API certificate, loaded exactly as the server would load it (PEM pair,
+PKCS#12 file or Windows store), with its expiry (warning under 30 days, failure
+once expired) and the client CA bundle for mutual TLS; the sender and allowlist;
+then one SMTP session with the mailhost: DNS, connect, STARTTLS or implicit
+TLS with certificate verification, `AUTH` when credentials are set, `MAIL FROM`
+with the configured sender, `RSET`, `QUIT`. **Nothing is sent.** A warning is
+raised when the mailhost advertises `AUTH` but no username is configured, when
+it advertises `STARTTLS` but the session is cleartext, and when the sender is
+outside the authenticated account's domain, which iCloud, Gmail and Microsoft
+365 reject at `MAIL FROM`. A port/security mismatch is named as such rather than
+reported as a bare handshake error. Secrets never appear in the output.
+
+Exit status: 0 when nothing failed (warnings included), 1 when a probe failed,
+2 when the configuration does not load at all. Run it as the account the
+service uses, so file permissions and certificate-key ACLs are part of the test:
+
+```bash
+# Linux payload
+sudo -u smtp-relay /opt/smtp-relay/python/bin/python3 -m app --check --config /etc/smtp-relay/config.toml
+# container (ENTRYPOINT is python -m app)
+docker run --rm -v ./config.toml:/etc/smtp-relay/config.toml:ro --env-file .env <image> --check
+```
+
+```powershell
+# Windows payload, elevated (reads %ProgramData%\SmtpRelay\config.toml)
+& 'C:\Program Files\SmtpRelay\python\python.exe' -m app --check
+```
+
+On Windows the elevated run proves the certificate and the mailhost; whether
+`NT SERVICE\SmtpRelay` itself may read the private key is what the installer's
+ACL step establishes, and a failure there shows up in the Application event log
+at service start.
 
 ### SMTP TLS (outbound, to the mailhost)
 
@@ -468,6 +528,7 @@ The usual deployment, behind a reverse proxy that terminates TLS:
 
 ```bash
 cp config.example.toml config.toml   # smtp.*, policy.*; leave api.host alone
+RELAY_API_TOKEN=... RELAY_SMTP_PASSWORD=... docker compose run --rm smtp-relay --check
 RELAY_API_TOKEN=... RELAY_SMTP_PASSWORD=... docker compose up -d
 curl -s http://127.0.0.1:8000/health
 ```
@@ -504,6 +565,7 @@ tar xzf SmtpRelay-0.3.0-linux_x86_64-cp315.tar.gz
 cd SmtpRelay-0.3.0-linux_x86_64-cp315
 sudo ./install.sh            # add --start to start immediately
 sudoedit /etc/smtp-relay/config.toml
+sudo -u smtp-relay /opt/smtp-relay/python/bin/python3 -m app --check --config /etc/smtp-relay/config.toml
 sudo systemctl start smtp-relay
 journalctl -u smtp-relay -f
 ```
@@ -595,6 +657,7 @@ Before touching the service at all, the real smoke test is a plain foreground ru
 which involves no Service Control Manager at all:
 
 ```powershell
+.venv\Scripts\python -m app --check
 .venv\Scripts\python -m app
 Invoke-RestMethod http://127.0.0.1:8000/health
 ```
@@ -982,7 +1045,8 @@ app/
   relay.py            MIME message building and SMTP delivery (-> 502)
   logging_setup.py    stderr vs. Windows Event Log
   main.py             FastAPI app factory and POST /mail
-  __main__.py         `python -m app` entry point
+  __main__.py         `python -m app` entry point and command line (`--check`, `--config`)
+  check.py            `--check`: certificate load, dry SMTP session (TLS, AUTH, MAIL FROM), no mail sent
   windows_service.py  native Windows service (pywin32, Windows only)
 tests/
 scripts/
@@ -1053,7 +1117,16 @@ referenced the store. The fake store in the test suite had no such rule, so it
 could not have said otherwise. The contexts are now freed first, that one code
 is tolerated, and the fake complains the way the real store does.
 
-All three were assumptions about a third-party API that no amount of Linux-side
+The fourth was not code but deployment: on the first real host, the relay came
+up clean and every message bounced. `smtp.username` was still commented out, so
+the relay never authenticated and iCloud answered `554 Client host rejected`,
+which reads like an IP block; with that fixed, `policy.sender` was not an
+address the account owned, `550 From address is not one of your addresses`.
+Both were only discoverable by sending mail. `--check` now holds the same SMTP
+session up to `MAIL FROM` without sending, and a password without a username is
+a configuration error.
+
+All four were assumptions about a third party that no amount of Linux-side
 testing would have caught. The countermeasure in each case is the same: bind
 against the real library, or read its source, rather than modelling what it
 probably does - and when the real thing can only run on another machine, run it

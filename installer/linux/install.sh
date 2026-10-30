@@ -242,9 +242,10 @@ Installation complete.
 
 Next steps:
   1. Edit the configuration:   sudoedit $CONFIG_DIR/config.toml
-  2. Start the service:        sudo systemctl start $SERVICE_NAME
-  3. Follow the logs:          journalctl -u $SERVICE_NAME -f
-  4. Health check:             curl -s http://127.0.0.1:8000/health
+  2. Check it (nothing sent):  sudo -u $SERVICE_USER $PY -m app --check --config $CONFIG_DIR/config.toml
+  3. Start the service:        sudo systemctl start $SERVICE_NAME
+  4. Follow the logs:          journalctl -u $SERVICE_NAME -f
+  5. Health check:             curl -s http://127.0.0.1:8000/health
 
 Exposing the API beyond this machine: set api.host in config.toml, then either
 serve TLS from the relay (api.ssl_certfile / api.ssl_keyfile, or a PKCS#12 file

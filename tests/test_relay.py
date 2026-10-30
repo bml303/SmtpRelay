@@ -309,6 +309,27 @@ def test_protocol_error_without_a_status_code(monkeypatch):
     assert "STARTTLS" in excinfo.value.detail
 
 
+def test_failed_starttls_closes_the_connection(monkeypatch):
+    """open_session() must not leak the socket when the handshake fails half-way."""
+    created: list[FakeSMTP] = []
+
+    class NoTls(FakeSMTP):
+        def starttls(self, context=None):
+            raise smtplib.SMTPNotSupportedError("STARTTLS extension not supported by server.")
+
+    def build(*args, **kwargs):
+        created.append(NoTls(*args, **kwargs))
+        return created[-1]
+
+    monkeypatch.setattr(smtplib, "SMTP", build)
+    relay = SmtpRelay(SmtpConfig(host="mail.example.com", port=587))
+
+    with pytest.raises(RelayError):
+        relay.send(make_message(), sender="relay@example.com", recipients=["a@example.com"])
+
+    assert created and created[0].closed
+
+
 def test_unreachable_host_becomes_relay_error(monkeypatch):
     def explode(*args, **kwargs):
         raise OSError("Connection refused")

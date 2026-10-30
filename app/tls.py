@@ -28,6 +28,7 @@ in front of the relay instead (``api.behind_tls_proxy``).
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 import logging
 import os
 import re
@@ -75,21 +76,55 @@ def windows_store_available() -> bool:
 
 @dataclass(frozen=True)
 class LoadedCertificate:
-    """What a decoded PKCS#12 blob yielded, for logging and tests."""
+    """What a certificate source yielded, for logging, ``--check`` and tests."""
 
     subject: str
     not_after: str
     thumbprint: str
     chain_length: int
+    #: Where the material came from, operator-readable ("PEM file ...",
+    #: "PKCS#12 file ...", "Windows certificate store ...").
+    source: str = ""
+    expires_at: datetime | None = None
+
+    def days_left(self, now: datetime | None = None) -> int | None:
+        """Whole days until expiry (negative once expired); ``None`` if unknown."""
+        if self.expires_at is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        return (self.expires_at - now).days
 
 
-def build_ssl_context(api: ApiConfig) -> ssl.SSLContext:
-    """Build the server context for a PFX or Windows-store source.
+def _describe(cert: Any, chain_length: int, source: str) -> LoadedCertificate:
+    from cryptography.hazmat.primitives.serialization import Encoding
 
-    Raises :class:`TlsError` with an operator-readable message; the entry points
-    turn that into a configuration error at startup rather than a traceback in
-    uvicorn's worker thread.
+    expires_at = cert.not_valid_after_utc
+    return LoadedCertificate(
+        subject=cert.subject.rfc4514_string(),
+        not_after=expires_at.isoformat(timespec="seconds"),
+        thumbprint=hashlib.sha1(cert.public_bytes(Encoding.DER)).hexdigest().upper(),
+        chain_length=chain_length,
+        source=source,
+        expires_at=expires_at,
+    )
+
+
+def load_server_context(api: ApiConfig) -> tuple[ssl.SSLContext, LoadedCertificate]:
+    """Build the server context for whichever certificate source ``api`` names.
+
+    Covers all three sources, so ``--check`` exercises exactly the material the
+    server would load - including the PEM pair, which the entry points otherwise
+    hand to uvicorn as plain file paths. Raises :class:`TlsError` with an
+    operator-readable message.
     """
+    if api.ssl_certfile is not None:
+        return context_from_pem(
+            api.ssl_certfile,
+            api.ssl_keyfile,
+            api.ssl_keyfile_password,
+            cert_reqs=api.verify_mode,
+            ca_certs=api.ssl_ca_certs,
+        )
     if api.ssl_pfxfile is not None:
         try:
             blob = Path(api.ssl_pfxfile).read_bytes()
@@ -100,21 +135,69 @@ def build_ssl_context(api: ApiConfig) -> ssl.SSLContext:
     elif api.ssl_cert_thumbprint is not None:
         blob, password = export_from_windows_store(api.ssl_cert_thumbprint)
         source = f"Windows certificate store LocalMachine\\{WINDOWS_STORE_NAME}, thumbprint {api.ssl_cert_thumbprint}"
-    else:  # pragma: no cover - ApiConfig only hands over the two sources above
-        raise TlsError("no PKCS#12 or certificate-store source is configured")
+    else:  # pragma: no cover - ApiConfig only hands over the sources above
+        raise TlsError("no certificate source is configured")
 
-    context, info = context_from_pkcs12(
+    return context_from_pkcs12(
         blob,
         password,
         cert_reqs=api.verify_mode,
         ca_certs=api.ssl_ca_certs,
         source=source,
     )
+
+
+def build_ssl_context(api: ApiConfig) -> ssl.SSLContext:
+    """Build the server context for a PFX or Windows-store source.
+
+    The entry points turn a :class:`TlsError` into a configuration error at
+    startup rather than a traceback in uvicorn's worker thread.
+    """
+    context, info = load_server_context(api)
     log.info(
         "TLS certificate from %s: subject %s, thumbprint %s, valid until %s, %d chain certificate(s)",
-        source, info.subject, info.thumbprint, info.not_after, info.chain_length,
+        info.source, info.subject, info.thumbprint, info.not_after, info.chain_length,
     )
     return context
+
+
+def context_from_pem(
+    certfile: Path | str,
+    keyfile: Path | str | None,
+    password: str | None,
+    *,
+    cert_reqs: int = ssl.CERT_NONE,
+    ca_certs: Path | str | None = None,
+) -> tuple[ssl.SSLContext, LoadedCertificate]:
+    """Load a PEM certificate (chain) and key the way uvicorn would."""
+    from cryptography import x509
+
+    source = f"PEM file {certfile}"
+    try:
+        pem = Path(certfile).read_bytes()
+    except OSError as exc:
+        raise TlsError(f"api.ssl_certfile: cannot read {certfile}: {exc}") from exc
+    try:
+        certs = x509.load_pem_x509_certificates(pem)
+    except ValueError as exc:
+        raise TlsError(f"{source}: no PEM certificate found ({exc})") from exc
+    info = _describe(certs[0], len(certs) - 1, source)
+
+    from uvicorn.config import create_ssl_context
+
+    try:
+        context = create_ssl_context(
+            str(certfile),
+            str(keyfile) if keyfile is not None else None,
+            password,
+            ssl.PROTOCOL_TLS_SERVER,
+            cert_reqs,
+            str(ca_certs) if ca_certs is not None else None,
+            None,
+        )
+    except (ssl.SSLError, OSError) as exc:
+        raise TlsError(f"{source}: OpenSSL rejected the certificate or key: {exc}") from exc
+    return context, info
 
 
 def context_from_pkcs12(
@@ -151,12 +234,7 @@ def context_from_pkcs12(
     if cert is None:
         raise TlsError(f"{source}: contains no certificate")
 
-    info = LoadedCertificate(
-        subject=cert.subject.rfc4514_string(),
-        not_after=cert.not_valid_after_utc.isoformat(timespec="seconds"),
-        thumbprint=hashlib.sha1(cert.public_bytes(Encoding.DER)).hexdigest().upper(),
-        chain_length=len(chain),
-    )
+    info = _describe(cert, len(chain), source)
 
     # The standard library can only load a key pair from files. Keep the window
     # small and the content useless on its own: PEM-encrypt the key under a

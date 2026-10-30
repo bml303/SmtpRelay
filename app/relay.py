@@ -75,17 +75,32 @@ class SmtpRelay:
             local_hostname=config.local_hostname,
         )
 
+    def open_session(self) -> smtplib.SMTP:
+        """Connect and negotiate the configured transport security.
+
+        Returns a client that has completed EHLO (and STARTTLS, where
+        configured) but has not authenticated. Shared with the ``--check``
+        probe so that it tests exactly the handshake delivery uses.
+        """
+        client = self._connect()
+        try:
+            if self._config.resolved_security == "starttls":
+                client.ehlo()
+                client.starttls(context=self._ssl_context())
+                client.ehlo()
+        except BaseException:
+            with suppress(smtplib.SMTPException, OSError):
+                client.close()
+            raise
+        return client
+
     def send(self, message: EmailMessage, *, sender: str, recipients: Sequence[str]) -> str:
         """Deliver ``message`` and return its Message-ID."""
         config = self._config
         security = config.resolved_security
         client: smtplib.SMTP | None = None
         try:
-            client = self._connect()
-            if security == "starttls":
-                client.ehlo()
-                client.starttls(context=self._ssl_context())
-                client.ehlo()
+            client = self.open_session()
             if config.username:
                 client.login(config.username, config.password or "")
             client.send_message(message, from_addr=sender, to_addrs=list(recipients))

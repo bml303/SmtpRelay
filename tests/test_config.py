@@ -117,6 +117,7 @@ reject_base64 = false
 def test_env_overrides_the_file(tmp_path, monkeypatch):
     monkeypatch.setenv("RELAY_SMTP_HOST", "override.example.com")
     monkeypatch.setenv("RELAY_SMTP_PORT", "2525")
+    monkeypatch.setenv("RELAY_SMTP_USERNAME", "relay")
     monkeypatch.setenv("RELAY_SMTP_PASSWORD", "from-env")
     monkeypatch.setenv("RELAY_ALLOWED_DOMAINS", "a.com, b.com ,c.com")
     monkeypatch.setenv("RELAY_ALLOW_SUBDOMAINS", "true")
@@ -127,6 +128,7 @@ def test_env_overrides_the_file(tmp_path, monkeypatch):
 
     assert config.smtp.host == "override.example.com"
     assert config.smtp.port == 2525
+    assert config.smtp.username == "relay"
     assert config.smtp.password == "from-env"
     assert config.smtp.resolved_security == "starttls"
     assert config.policy.allowed_domains == ["a.com", "b.com", "c.com"]
@@ -349,6 +351,18 @@ def test_unknown_security_mode_is_rejected(tmp_path):
 
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_password_without_a_username_is_rejected(tmp_path):
+    """The relay only authenticates when a username is set, so a lone password
+    would be silently ignored and the mailhost would refuse every message."""
+    config = write_config(
+        tmp_path,
+        MINIMAL.replace('host = "mail.example.com"', 'host = "mail.example.com"\npassword = "x"'),
+    )
+
+    with pytest.raises(ConfigError, match="smtp.password is set but smtp.username is not"):
+        load_config(config)
 
 
 def test_invalid_sender_is_rejected(tmp_path):

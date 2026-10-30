@@ -14,7 +14,15 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    model_validator,
+)
 
 SecurityMode = Literal["starttls", "tls", "none"]
 
@@ -51,6 +59,19 @@ class SmtpConfig(BaseModel):
     ca_file: Path | None = None
     #: Name used in EHLO/HELO. Defaults to the local FQDN when omitted.
     local_hostname: str | None = None
+
+    @model_validator(mode="after")
+    def _password_needs_a_username(self) -> "SmtpConfig":
+        """A password on its own is silently ignored - the relay only
+        authenticates when a username is set - which leaves the mailhost
+        refusing every message with a misleading "access denied"."""
+        if self.password is not None and not self.username:
+            raise ValueError(
+                "smtp.password is set but smtp.username is not; the relay only "
+                "authenticates when both are set. Set smtp.username (or "
+                "RELAY_SMTP_USERNAME), or drop the password."
+            )
+        return self
 
     @property
     def resolved_security(self) -> SecurityMode:
@@ -278,6 +299,13 @@ class AppConfig(BaseModel):
     smtp: SmtpConfig
     policy: PolicyConfig
 
+    #: Where :func:`load_config` took the values from, for ``--check`` output.
+    _source: str = PrivateAttr(default="in memory")
+
+    @property
+    def source(self) -> str:
+        return self._source
+
     @model_validator(mode="after")
     def _network_exposure_needs_tls_and_auth(self) -> "AppConfig":
         """Refuse to come up as a network-reachable cleartext open relay.
@@ -465,7 +493,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
 
     source = str(used) if used is not None else "environment only"
     try:
-        return AppConfig.model_validate(_apply_env_overrides(raw))
+        settings = AppConfig.model_validate(_apply_env_overrides(raw))
     except ValidationError as exc:
         searched = (
             ""
@@ -474,3 +502,11 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
             + ", ".join(str(candidate) for candidate in candidates)
         )
         raise ConfigError(f"Invalid configuration (from {source}):{searched}\n{exc}") from exc
+    settings._source = source
+    return settings
+
+
+def active_env_overrides() -> list[str]:
+    """Names of the ``RELAY_*`` override variables present in the environment."""
+    names = list(_ENV_OVERRIDES) + list(_LIST_OVERRIDES)
+    return [name for name in names if os.environ.get(name) is not None]
