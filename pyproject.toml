@@ -1,6 +1,6 @@
 [project]
 name = "smtp-relay"
-version = "0.3.4-rc.3"
+version = "0.3.4"
 description = "REST-to-SMTP relay: validates JSON against a schema, allowlists recipient domains, and delivers via a configurable mailhost over STARTTLS or implicit TLS."
 readme = "README.md"
 license = "MIT"
