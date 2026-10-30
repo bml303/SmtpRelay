@@ -1042,6 +1042,16 @@ Fixed by passing `serviceClassString=SERVICE_CLASS_STRING` explicitly, with a te
 that resolves the constant through `importlib.util.find_spec` so a bad path fails
 here rather than on a Windows host.
 
-Both were assumptions about a third-party API that no amount of Linux-side testing
-would have caught. The countermeasure in each case is the same: bind against the
-real library, or read its source, rather than modelling what it probably does.
+The third was CryptoAPI through pywin32, in the Windows certificate store source.
+Locating and exporting the certificate worked first time, built from the
+library's export table; the final `CertCloseStore` then failed with
+`CRYPT_E_PENDING_CLOSE`, because every enumerated certificate context still
+referenced the store. The fake store in the test suite had no such rule, so it
+could not have said otherwise. The contexts are now freed first, that one code
+is tolerated, and the fake complains the way the real store does.
+
+All three were assumptions about a third-party API that no amount of Linux-side
+testing would have caught. The countermeasure in each case is the same: bind
+against the real library, or read its source, rather than modelling what it
+probably does - and when the real thing can only run on another machine, run it
+there before calling the work done.
