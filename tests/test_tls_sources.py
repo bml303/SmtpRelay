@@ -264,7 +264,11 @@ def test_context_factory_matches_uvicorns_calling_convention(tmp_path, material)
     pfx.write_bytes(material.pfx("pw"))
     api = ApiConfig(ssl_pfxfile=pfx, ssl_pfx_password="pw")
 
-    config = uvicorn.Config("app.main:create_app", factory=True, **api.uvicorn_ssl_kwargs())
+    async def asgi(scope, receive, send):  # pragma: no cover - never served
+        pass
+
+    # A callable app, so load() does not import anything or read a config file.
+    config = uvicorn.Config(asgi, **api.uvicorn_ssl_kwargs())
     config.load()
 
     assert isinstance(config.ssl, ssl.SSLContext)
@@ -294,8 +298,9 @@ def test_entry_points_build_the_context_inside_their_config_error_guard():
     traceback (CLI) or a dead worker thread behind a RUNNING service."""
     import ast
 
+    root = Path(__file__).resolve().parents[1]
     for module in ("app/__main__.py", "app/windows_service.py"):
-        tree = ast.parse(Path(module).read_text())
+        tree = ast.parse((root / module).read_text())
         guarded = False
         for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
