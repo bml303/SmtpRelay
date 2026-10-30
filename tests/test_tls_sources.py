@@ -325,6 +325,10 @@ class FakeCertContext:
         self.CertEncoded = der
         self.key = key
         self.exportable = exportable
+        self.freed = False
+
+    def CertFreeCertificateContext(self):
+        self.freed = True
 
 
 class FakeStore:
@@ -354,6 +358,10 @@ class FakeStore:
 
     def CertCloseStore(self, flags):
         self.closed = True
+        # Like the real store: complain if enumerated contexts were not freed.
+        if any(not ctx.freed for ctx in self.contexts if isinstance(ctx, FakeCertContext)):
+            raise FakeWinError(-2146885617, "PyCERTSTORE::CertCloseStore",
+                               "Final closure is pending until additional frees or closes.")
 
 
 @pytest.fixture
@@ -404,6 +412,29 @@ def test_store_source_exports_the_matching_certificate_and_serves_it(fake_store,
 
     assert ("commonName", "localhost") in [item for rdn in peer["subject"] for item in rdn]
     assert all(store.closed for store in fake_store.opened), "store handles leaked"
+    assert all(ctx.freed for ctx in fake_store.contexts), "enumerated contexts not freed"
+
+
+def test_pending_close_from_the_store_is_tolerated(fake_store, material, monkeypatch):
+    """What the first Windows run hit: CertCloseStore raising CRYPT_E_PENDING_CLOSE
+    (0x8009200F) because contexts were still alive. The store is closed anyway."""
+    fake_store.contexts.append(FakeCertContext(material.der, material.key))
+    monkeypatch.setattr(FakeCertContext, "CertFreeCertificateContext", lambda self: None)
+
+    context = tls.build_ssl_context(ApiConfig(ssl_cert_thumbprint=material.thumbprint))
+
+    assert isinstance(context, ssl.SSLContext)
+
+
+def test_other_close_errors_are_config_errors_not_tracebacks(fake_store, material, monkeypatch):
+    fake_store.contexts.append(FakeCertContext(material.der, material.key))
+
+    def explode(self, flags):
+        raise FakeWinError(-2147024891, "PyCERTSTORE::CertCloseStore", "Access is denied.")
+
+    monkeypatch.setattr(FakeStore, "CertCloseStore", explode)
+    with pytest.raises(tls.TlsError, match="cannot close certificate store"):
+        tls.build_ssl_context(ApiConfig(ssl_cert_thumbprint=material.thumbprint))
 
 
 def test_store_source_accepts_thumbprints_as_certlm_shows_them(fake_store, material):

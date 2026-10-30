@@ -232,10 +232,15 @@ def export_from_windows_store(thumbprint: str) -> tuple[bytes, str]:
     except pywintypes.error as exc:
         raise TlsError(f"cannot open certificate store {where}: {_win_error(exc)}") from exc
 
+    contexts: list[Any] = []
+    memory = None
     try:
+        try:
+            contexts = list(store.CertEnumCertificatesInStore())
+        except pywintypes.error as exc:
+            raise TlsError(f"cannot enumerate certificate store {where}: {_win_error(exc)}") from exc
         matches = [
-            ctx
-            for ctx in store.CertEnumCertificatesInStore()
+            ctx for ctx in contexts
             if hashlib.sha1(ctx.CertEncoded).hexdigest().upper() == wanted
         ]
         if not matches:
@@ -245,8 +250,8 @@ def export_from_windows_store(thumbprint: str) -> tuple[bytes, str]:
                 "(Certificates - Local Computer > Personal > Certificates)."
             )
         password = secrets.token_urlsafe(32)
-        memory = win32crypt.CertOpenStore(c.CERT_STORE_PROV_MEMORY, 0, None, 0, None)
         try:
+            memory = win32crypt.CertOpenStore(c.CERT_STORE_PROV_MEMORY, 0, None, 0, None)
             memory.CertAddCertificateContextToStore(matches[0], c.CERT_STORE_ADD_ALWAYS)
             # The REPORT_* flags turn "exported without its key" into an error
             # here, instead of an unusable context further down.
@@ -264,11 +269,35 @@ def export_from_windows_store(thumbprint: str) -> tuple[bytes, str]:
                 "must stay non-exportable can only be used by terminating TLS in IIS or "
                 "HTTP.sys in front of the relay; see api.behind_tls_proxy."
             ) from exc
-        finally:
-            memory.CertCloseStore(0)
     finally:
-        store.CertCloseStore(0)
+        # Every enumerated context holds a reference to the store. Free them
+        # before closing, otherwise CertCloseStore reports CRYPT_E_PENDING_CLOSE
+        # (seen on the first Windows run) - the store is closed regardless, so
+        # that code is tolerated too; anything else is a real failure.
+        for ctx in contexts:
+            try:
+                ctx.CertFreeCertificateContext()
+            except Exception:  # noqa: BLE001 - best effort, the store close below decides
+                pass
+        if memory is not None:
+            _close_store(memory, "in-memory export store", pywintypes)
+        _close_store(store, where, pywintypes)
     return bytes(blob), password
+
+
+#: CertCloseStore: "Final closure is pending until additional frees or closes."
+CRYPT_E_PENDING_CLOSE = 0x8009200F
+
+
+def _close_store(store: Any, what: str, pywintypes: Any) -> None:
+    try:
+        store.CertCloseStore(0)
+    except pywintypes.error as exc:
+        code = exc.args[0] & 0xFFFFFFFF if exc.args and isinstance(exc.args[0], int) else None
+        if code == CRYPT_E_PENDING_CLOSE:
+            log.debug("certificate store %s closed with frees pending", what)
+            return
+        raise TlsError(f"cannot close certificate store {what}: {_win_error(exc)}") from exc
 
 
 def _win_error(exc: Any) -> str:
