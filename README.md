@@ -179,7 +179,7 @@ the real world, then exits without serving:
 ```
 
 ```
-smtp-relay 0.3.3 configuration check
+smtp-relay 0.3.4 configuration check
   ok    config        /etc/smtp-relay/config.toml (overridden from the environment: RELAY_SMTP_PASSWORD)
   ok    api           https://0.0.0.0:8000, reachable from the network, TLS served by this process, clients authenticate with client certificate (mutual TLS)
   ok    api.tls       PKCS#12 file /etc/smtp-relay/relay.pfx: subject CN=relay.example.com, thumbprint 52B4..., valid for 364 more days (until 2027-10-29T09:12:00+00:00); client certificates required, 1 CA certificate(s) loaded from /etc/smtp-relay/client-ca.pem
