@@ -1,3 +1,3 @@
 """SMTP relay service: JSON in, mail out."""
 
-__version__ = "0.3.4-rc.2"
+__version__ = "0.3.4-rc.3"
