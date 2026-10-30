@@ -663,7 +663,7 @@ def test_installer_scripts_have_valid_powershell_syntax():
     if build_dist.find_pwsh() is None:
         pytest.skip("no pwsh available; set PWSH=/path/to/pwsh to enable this check")
 
-    scripts = sorted(build_dist.INSTALLER_DIR.glob("*.ps1"))
+    scripts = sorted(build_dist.WINDOWS_INSTALLER_DIR.glob("*.ps1"))
     assert scripts, "no installer scripts found"
 
     # Raises SystemExit if any script fails to parse.
