@@ -356,3 +356,17 @@ def test_invalid_sender_is_rejected(tmp_path):
 
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_config_file_with_a_utf8_bom_loads(tmp_path, monkeypatch):
+    """Notepad and Windows PowerShell 5.1 may write a BOM; it must not be a syntax error."""
+    for name in [key for key in os.environ if key.startswith("RELAY_")]:
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "config.toml"
+    path.write_bytes(
+        b"\xef\xbb\xbf[smtp]\nhost = \"mail.example.com\"\n\n[policy]\nsender = \"relay@example.com\"\n"
+    )
+
+    config = load_config(path)
+
+    assert config.smtp.host == "mail.example.com"

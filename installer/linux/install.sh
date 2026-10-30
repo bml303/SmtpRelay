@@ -247,7 +247,8 @@ Next steps:
   4. Health check:             curl -s http://127.0.0.1:8000/health
 
 Exposing the API beyond this machine: set api.host in config.toml, then either
-serve TLS from the relay (api.ssl_certfile / api.ssl_keyfile) or declare a
+serve TLS from the relay (api.ssl_certfile / api.ssl_keyfile, or a PKCS#12 file
+via api.ssl_pfxfile) or declare a
 TLS-terminating reverse proxy (api.behind_tls_proxy = true), and in both cases
 set api.token or require mutual TLS. The application refuses to start otherwise,
 so it cannot silently become a cleartext open relay.

@@ -173,10 +173,11 @@ def test_no_unexpected_platform_marked_pins():
 def test_only_well_wheeled_packages_remain_compiled():
     """Everything else must be pure Python or have universal Windows wheels.
 
-    pydantic-core and pywin32 are the only compiled packages left, and both
-    publish wheels across win_amd64/win_arm64 for cp311-cp315.
+    pydantic-core, pywin32, cffi and cryptography are the only compiled
+    packages, and all publish wheels across win_amd64/win_arm64 for cp311-cp315
+    (cryptography only up to 46.x on win_arm64, hence its pin).
     """
-    known_compiled = {"pydantic-core", "pywin32"}
+    known_compiled = {"pydantic-core", "pywin32", "cffi", "cryptography"}
     entries = _pinned_entries()
 
     assert known_compiled <= set(entries), "expected compiled packages went missing"

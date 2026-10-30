@@ -16,6 +16,9 @@ dependencies = [
     # left are pydantic-core and pywin32, both of which have complete wheels.
     "uvicorn>=0.30",
     "pydantic[email]>=2.7",
+    # PKCS#12 and Windows certificate store sources for the API certificate
+    # (app/tls.py). Capped below 47 because 47+ has no win_arm64 wheel.
+    "cryptography>=46,<47",
 ]
 
 [project.optional-dependencies]

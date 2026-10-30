@@ -5,7 +5,9 @@
 # requirements-dev.txt, which includes this file.
 #
 # Installs WITHOUT a C/C++ compiler everywhere: the only compiled packages are
-# pydantic-core and pywin32, both with complete wheels for cp311-cp315. That
+# pydantic-core, pywin32, cffi and cryptography, all with complete wheels for
+# cp311-cp315 on every target (cryptography is held at the newest release that
+# still publishes win_arm64 wheels; see the note at its pin). That
 # property depends on uvicorn being declared WITHOUT its [standard] extra
 # (httptools, PyYAML, watchfiles, websockets, python-dotenv, uvloop are neither
 # used nor wheel-complete on Windows); tests/test_windows_deployment.py guards it.
@@ -20,13 +22,22 @@
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+cffi==2.1.1
 click==8.5.0
+# cryptography decodes PKCS#12 (api.ssl_pfxfile) and the Windows certificate
+# store export (api.ssl_cert_thumbprint); see app/tls.py. 46.0.3 is the last
+# release with a win_arm64 wheel - 47+ ships none - so it is pinned there for
+# every target to keep one SBOM entry per package. Revisit when
+#   pip index versions cryptography --platform win_arm64 --python-version 3.15 --only-binary=:all:
+# lists something newer.
+cryptography==46.0.3
 dnspython==2.9.0
 email-validator==2.3.0
 fastapi==0.162.0
 h11==0.16.0
 idna==3.20
 opentelemetry-api==1.45.1
+pycparser==3.12
 pydantic==2.14.1
 pydantic_core==2.50.1
 starlette==1.10.0

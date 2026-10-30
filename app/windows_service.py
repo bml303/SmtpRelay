@@ -111,6 +111,10 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
 
         try:
             settings = load_config()
+            # Decodes a PKCS#12 / certificate-store source under the service
+            # account, in this thread: a failure is reported as a configuration
+            # error below instead of killing the uvicorn worker thread.
+            ssl_kwargs = settings.api.uvicorn_ssl_kwargs()
         except ConfigError as exc:
             # Returning (rather than raising) reports a clean stop; the reason is
             # in the event log, which is where an operator will look.
@@ -127,7 +131,7 @@ class SmtpRelayService(win32serviceutil.ServiceFramework):
                 port=settings.api.port,
                 # Keep uvicorn from replacing the event log handler installed above.
                 log_config=None,
-                **settings.api.uvicorn_ssl_kwargs(),
+                **ssl_kwargs,
             )
         )
         self._server = server

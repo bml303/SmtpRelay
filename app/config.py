@@ -92,6 +92,16 @@ class ApiConfig(BaseModel):
     ssl_ca_certs: Path | None = None
     ssl_cert_reqs: SslVerifyMode | None = None
 
+    #: Alternative certificate sources, decoded by :mod:`app.tls`. Exactly one
+    #: of ``ssl_certfile``, ``ssl_pfxfile`` and ``ssl_cert_thumbprint`` may be
+    #: set; ``ssl_ca_certs`` / ``ssl_cert_reqs`` combine with any of them.
+    #: A PKCS#12 (.pfx/.p12) file holding the certificate, chain and key.
+    ssl_pfxfile: Path | None = None
+    ssl_pfx_password: str | None = None
+    #: SHA-1 thumbprint of a certificate in the Windows LocalMachine\My store
+    #: whose key was imported as exportable. Windows only.
+    ssl_cert_thumbprint: str | None = None
+
     #: Declares that a reverse proxy or ingress on a private network terminates
     #: TLS in front of this process - the usual container deployment, where the
     #: app must bind 0.0.0.0 to be reachable at all. It waives only the TLS half
@@ -102,32 +112,61 @@ class ApiConfig(BaseModel):
     behind_tls_proxy: bool = False
 
     @model_validator(mode="after")
+    def _one_certificate_source(self) -> "ApiConfig":
+        """Exactly one place to take the server certificate from."""
+        if len(self.certificate_sources) > 1:
+            raise ValueError(
+                "api." + ", api.".join(self.certificate_sources)
+                + " are all set; choose one certificate source."
+            )
+        if self.ssl_cert_thumbprint is not None:
+            from .tls import normalize_thumbprint, windows_store_available
+
+            self.ssl_cert_thumbprint = normalize_thumbprint(self.ssl_cert_thumbprint)
+            if not windows_store_available():
+                raise ValueError(
+                    "api.ssl_cert_thumbprint reads the Windows certificate store and is "
+                    f"only available on Windows (this is {sys.platform}); use "
+                    "api.ssl_pfxfile or api.ssl_certfile here."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _tls_is_terminated_in_one_place(self) -> "ApiConfig":
-        if self.behind_tls_proxy and self.ssl_certfile is not None:
+        if self.behind_tls_proxy and self.tls_enabled:
             raise ValueError(
                 "api.behind_tls_proxy = true says a reverse proxy terminates TLS, "
-                "but api.ssl_certfile makes this process terminate it as well. "
-                "Behind a proxy leave the api.ssl_* keys unset; to serve TLS from "
-                "this process, drop behind_tls_proxy."
+                f"but api.{self.certificate_sources[0]} makes this process terminate "
+                "it as well. Behind a proxy leave the api.ssl_* keys unset; to serve "
+                "TLS from this process, drop behind_tls_proxy."
             )
         return self
 
     @model_validator(mode="after")
-    def _require_certfile_for_tls(self) -> "ApiConfig":
+    def _no_dangling_tls_options(self) -> "ApiConfig":
         """Reject a half-configured TLS setup at startup, not inside uvicorn."""
-        if self.ssl_certfile is not None:
-            return self
-        others = {
-            "ssl_keyfile": self.ssl_keyfile,
-            "ssl_keyfile_password": self.ssl_keyfile_password,
-            "ssl_ca_certs": self.ssl_ca_certs,
-            "ssl_cert_reqs": self.ssl_cert_reqs,
-        }
-        dangling = sorted(name for name, value in others.items() if value is not None)
-        if dangling:
-            raise ValueError(
-                "api.ssl_certfile is required when these are also set: " + ", ".join(dangling)
-            )
+        if self.ssl_certfile is None:
+            dangling = [
+                name for name in ("ssl_keyfile", "ssl_keyfile_password")
+                if getattr(self, name) is not None
+            ]
+            if dangling:
+                raise ValueError(
+                    "api.ssl_certfile is required when these are also set: " + ", ".join(dangling)
+                )
+        if self.ssl_pfxfile is None and self.ssl_pfx_password is not None:
+            raise ValueError("api.ssl_pfxfile is required when api.ssl_pfx_password is set")
+        if not self.tls_enabled:
+            dangling = [
+                name for name in ("ssl_ca_certs", "ssl_cert_reqs")
+                if getattr(self, name) is not None
+            ]
+            if dangling:
+                raise ValueError(
+                    "a certificate source (api.ssl_certfile, api.ssl_pfxfile or "
+                    "api.ssl_cert_thumbprint) is required when these are also set: "
+                    + ", ".join(dangling)
+                )
         return self
 
     @model_validator(mode="after")
@@ -158,21 +197,53 @@ class ApiConfig(BaseModel):
         return self
 
     @property
+    def certificate_sources(self) -> list[str]:
+        """Names of the certificate-source keys that are set (normally 0 or 1)."""
+        return [
+            name for name in ("ssl_certfile", "ssl_pfxfile", "ssl_cert_thumbprint")
+            if getattr(self, name) is not None
+        ]
+
+    @property
     def tls_enabled(self) -> bool:
-        return self.ssl_certfile is not None
+        return bool(self.certificate_sources)
 
     @property
     def scheme(self) -> str:
         return "https" if self.tls_enabled else "http"
 
+    @property
+    def verify_mode(self) -> int:
+        """``ssl_cert_reqs`` as the ``ssl.VerifyMode`` int uvicorn expects."""
+        if self.ssl_cert_reqs is None:
+            return ssl.CERT_NONE
+        return SSL_VERIFY_MODES[self.ssl_cert_reqs]
+
     def uvicorn_ssl_kwargs(self) -> dict[str, Any]:
         """Keyword arguments for uvicorn; empty when TLS is off.
 
         Shared by both entry points so the CLI and the Windows service cannot
-        drift apart in how they enable TLS.
+        drift apart in how they enable TLS. A PEM source is passed through as
+        file paths. The PKCS#12 and certificate-store sources are decoded here
+        and now - in the main thread, at startup, where a failure becomes a
+        :class:`ConfigError` - and handed to uvicorn as a ready-made context.
         """
         if not self.tls_enabled:
             return {}
+        if self.ssl_certfile is None:
+            from .tls import TlsError, build_ssl_context
+
+            try:
+                context = build_ssl_context(self)
+            except TlsError as exc:
+                raise ConfigError(str(exc)) from exc
+
+            # uvicorn calls the factory as factory(config, default_factory) when
+            # the server loads; the context is already built, so both are ignored.
+            def ssl_context_factory(*_: Any) -> ssl.SSLContext:
+                return context
+
+            return {"ssl_context_factory": ssl_context_factory}
         kwargs: dict[str, Any] = {"ssl_certfile": str(self.ssl_certfile)}
         if self.ssl_keyfile is not None:
             kwargs["ssl_keyfile"] = str(self.ssl_keyfile)
@@ -237,7 +308,8 @@ class AppConfig(BaseModel):
         problems = []
         if not self.api.tls_enabled and not self.api.behind_tls_proxy:
             problems.append(
-                "api.ssl_certfile is unset, so traffic including the bearer "
+                "no certificate source (api.ssl_certfile, api.ssl_pfxfile or "
+                "api.ssl_cert_thumbprint) is set, so traffic including the bearer "
                 "token would cross the network in cleartext (set "
                 "api.behind_tls_proxy = true only when a reverse proxy on a "
                 "private network terminates TLS for it)"
@@ -269,6 +341,9 @@ _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     "RELAY_API_SSL_KEYFILE_PASSWORD": ("api", "ssl_keyfile_password"),
     "RELAY_API_SSL_CA_CERTS": ("api", "ssl_ca_certs"),
     "RELAY_API_SSL_CERT_REQS": ("api", "ssl_cert_reqs"),
+    "RELAY_API_SSL_PFXFILE": ("api", "ssl_pfxfile"),
+    "RELAY_API_SSL_PFX_PASSWORD": ("api", "ssl_pfx_password"),
+    "RELAY_API_SSL_CERT_THUMBPRINT": ("api", "ssl_cert_thumbprint"),
     "RELAY_API_BEHIND_TLS_PROXY": ("api", "behind_tls_proxy"),
     "RELAY_SMTP_HOST": ("smtp", "host"),
     "RELAY_SMTP_PORT": ("smtp", "port"),
@@ -375,9 +450,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         if not candidate.is_file():
             continue
         try:
-            with candidate.open("rb") as handle:
-                raw = tomllib.load(handle)
-        except tomllib.TOMLDecodeError as exc:
+            # utf-8-sig: Notepad and older PowerShell save a UTF-8 BOM, which
+            # tomllib.load() would reject as an invalid statement.
+            raw = tomllib.loads(candidate.read_bytes().decode("utf-8-sig"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             raise ConfigError(f"{candidate} is not valid TOML: {exc}") from exc
         except OSError as exc:
             raise ConfigError(f"Could not read {candidate}: {exc}") from exc

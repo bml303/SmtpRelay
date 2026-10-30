@@ -25,12 +25,25 @@ max_recipients = 50
 # 127.0.0.1 the API is loopback-only and never crosses the network, so TLS buys
 # nothing. Enable it when remote clients connect directly (i.e. you are not
 # terminating TLS in a reverse proxy in front of this service).
-# Setting ssl_certfile switches the endpoint to HTTPS. The certificate's SAN must
-# match the hostname clients use, or their TLS verification will fail.
+# Any ONE of the three certificate sources switches the endpoint to HTTPS. The
+# certificate's SAN must match the hostname clients use, or their TLS
+# verification will fail.
+#
+# 1. PEM files:
 # ssl_certfile = "/etc/ssl/certs/smtp-relay.crt"
 # ssl_keyfile = "/etc/ssl/private/smtp-relay.key"
 # Passphrase for an encrypted key. Prefer RELAY_API_SSL_KEYFILE_PASSWORD.
 # ssl_keyfile_password = ""
+#
+# 2. A PKCS#12 (.pfx / .p12) file with certificate, chain and key:
+# ssl_pfxfile = "/etc/ssl/private/smtp-relay.pfx"
+# Prefer RELAY_API_SSL_PFX_PASSWORD over writing the passphrase here.
+# ssl_pfx_password = ""
+#
+# 3. Windows only: a certificate in the machine store (certlm.msc > Personal),
+#    identified by its SHA-1 thumbprint. install.ps1 -PfxPath fills this in and
+#    grants the service account access to the key, which must be exportable.
+# ssl_cert_thumbprint = "0123456789ABCDEF0123456789ABCDEF01234567"
 # Mutual TLS: verify clients against this CA bundle.
 # ssl_ca_certs = "/etc/ssl/certs/client-ca.pem"
 # "none" | "optional" | "required"; mapped to ssl.VerifyMode for uvicorn.

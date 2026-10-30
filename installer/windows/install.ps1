@@ -17,6 +17,20 @@
     Deliberately NOT under InstallDir: Program Files is wiped on upgrade and is
     readable by all local users, which matters if config.toml holds credentials.
 
+.PARAMETER PfxPath
+    A PKCS#12 (.pfx/.p12) file holding the API's TLS certificate and key. It is
+    imported into Cert:\LocalMachine\My with an EXPORTABLE key, the service
+    account is granted read access to that key, and api.ssl_cert_thumbprint in
+    config.toml is pointed at it. The passphrase is asked for interactively
+    unless -PfxPassword is given; it is used once and never stored.
+
+.PARAMETER PfxPassword
+    SecureString passphrase for -PfxPath. Omit to be prompted.
+
+.PARAMETER CertThumbprint
+    Use a certificate that is already in Cert:\LocalMachine\My instead of
+    importing one. Its key must be exportable. Grants and config as for -PfxPath.
+
 .PARAMETER Start
     Start the service once installation succeeds.
 
@@ -26,6 +40,7 @@
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -Start
+    powershell -ExecutionPolicy Bypass -File .\install.ps1 -PfxPath C:\certs\relay.pfx -Start
 #>
 #Requires -RunAsAdministrator
 [CmdletBinding()]
@@ -40,6 +55,10 @@ param(
     # by this service alone.
     [string] $ServiceAccount = "NT SERVICE\$ServiceName",
     [int]    $ApiPort = 8000,
+    # TLS certificate for the API, see the "API TLS certificate" step below.
+    [string]       $PfxPath,
+    [securestring] $PfxPassword,
+    [string]       $CertThumbprint,
     [switch] $OpenFirewall,
     [switch] $Start,
     [switch] $Force
@@ -104,6 +123,31 @@ Write-Ok "$wheelCount wheels available for offline install"
 
 if ((Test-Path $InstallDir) -and -not $Force) {
     Stop-WithError "'$InstallDir' already exists." "Re-run with -Force to replace it."
+}
+
+# Certificate switches are checked - and the passphrase asked for - before
+# anything is changed, so a typo here cannot leave a half-installed service.
+if ($PfxPath -and $CertThumbprint) {
+    Stop-WithError "-PfxPath and -CertThumbprint are mutually exclusive." `
+        "Import a file with -PfxPath, or point at a certificate already in the store with -CertThumbprint."
+}
+if ($PfxPath) {
+    if (-not (Test-Path $PfxPath -PathType Leaf)) {
+        Stop-WithError "PFX file '$PfxPath' not found."
+    }
+    $PfxPath = (Resolve-Path $PfxPath).Path
+    if (-not $PfxPassword) {
+        $PfxPassword = Read-Host -Prompt "Passphrase for $PfxPath (empty if it has none)" -AsSecureString
+    }
+    Write-Ok "Will import $PfxPath into Cert:\LocalMachine\My"
+}
+if ($CertThumbprint) {
+    $CertThumbprint = ($CertThumbprint -replace '[\s:\-]', '').ToUpperInvariant()
+    if ($CertThumbprint -notmatch '^[0-9A-F]{40}$') {
+        Stop-WithError "-CertThumbprint must be the 40-digit SHA-1 thumbprint as shown by certlm.msc." `
+            "List candidates with: Get-ChildItem Cert:\LocalMachine\My | Format-Table Thumbprint, Subject, NotAfter"
+    }
+    Write-Ok "Will use certificate $CertThumbprint from Cert:\LocalMachine\My"
 }
 
 # An existing service must be deleted and re-created, never updated in place.
@@ -435,6 +479,130 @@ if ($aclFailures.Count -gt 0) {
          "  sc.exe showsid $ServiceName")
 }
 
+# ------------------------------------------------------- API TLS certificate
+
+# The relay's TLS is OpenSSL (Python's ssl module), which cannot sign with a
+# CNG key handle. With api.ssl_cert_thumbprint set, the service therefore
+# exports the certificate WITH its key through CryptoAPI at every start and
+# loads that - which is only possible for a key imported as exportable. Hence
+# Import-PfxCertificate -Exportable below, and the exportability check for a
+# pre-existing certificate. The key still never exists as a file the operator
+# manages, needs no passphrase in config.toml, and is replaced in certlm.msc
+# like any other machine certificate. Whoever needs a NON-exportable key must
+# terminate TLS in IIS or HTTP.sys in front of the relay (api.behind_tls_proxy).
+$certificate = $null
+if ($PfxPath -or $CertThumbprint) {
+    Write-Step "API TLS certificate"
+    $storePath = 'Cert:\LocalMachine\My'
+
+    if ($PfxPath) {
+        try {
+            $importArgs = @{ FilePath = $PfxPath; CertStoreLocation = $storePath; Exportable = $true }
+            if ($PfxPassword -and $PfxPassword.Length -gt 0) { $importArgs.Password = $PfxPassword }
+            $certificate = Import-PfxCertificate @importArgs
+        } catch {
+            Stop-WithError "Could not import '$PfxPath' into $storePath." $_.Exception.Message
+        }
+        Write-Ok "Imported $($certificate.Thumbprint) into $storePath (exportable key)"
+    } else {
+        $certificate = Get-Item (Join-Path $storePath $CertThumbprint) -ErrorAction SilentlyContinue
+        if (-not $certificate) {
+            Stop-WithError "No certificate with thumbprint $CertThumbprint in $storePath." `
+                "List candidates with: Get-ChildItem Cert:\LocalMachine\My | Format-Table Thumbprint, Subject, NotAfter"
+        }
+        Write-Ok "Found $CertThumbprint in $storePath"
+    }
+
+    if (-not $certificate.HasPrivateKey) {
+        Stop-WithError "Certificate $($certificate.Thumbprint) has no private key." `
+            "The relay needs the key to serve TLS; import a PFX that contains it (-PfxPath)."
+    }
+    if ($certificate.NotAfter -lt (Get-Date)) {
+        Write-Warn2 "This certificate EXPIRED on $($certificate.NotAfter). Clients will reject it."
+    }
+
+    # Machine keys live as files under ProgramData\Microsoft\Crypto - CNG (Key
+    # Storage Provider) and legacy CAPI keys in different subfolders - and the key
+    # object knows its own file name. Granting read on that file is exactly what
+    # certlm.msc's "Manage Private Keys" does. Exportability is checked here, in
+    # the installer, because the service's own error for it only shows at start.
+    $privateKey = $null; $uniqueName = $null; $exportable = $false
+    try {
+        $privateKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($certificate)
+        if (-not $privateKey) {
+            $privateKey = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($certificate)
+        }
+    } catch {
+        Stop-WithError "Cannot open the private key of $($certificate.Thumbprint)." $_.Exception.Message
+    }
+    if (-not $privateKey) {
+        Stop-WithError "The private key of $($certificate.Thumbprint) is neither RSA nor ECDSA, or is not accessible." `
+            "Only RSA and ECDSA certificates are supported."
+    }
+    if ($privateKey.PSObject.Properties['Key'] -and $privateKey.Key) {
+        # CNG: Microsoft Software Key Storage Provider (what Import-PfxCertificate uses).
+        $uniqueName = $privateKey.Key.UniqueName
+        $exportable = ($privateKey.Key.ExportPolicy -band [System.Security.Cryptography.CngExportPolicies]::AllowExport) -ne 0
+    } elseif ($privateKey.PSObject.Properties['CspKeyContainerInfo'] -and $privateKey.CspKeyContainerInfo) {
+        # Legacy CAPI cryptographic service provider.
+        $uniqueName = $privateKey.CspKeyContainerInfo.UniqueKeyContainerName
+        $exportable = $privateKey.CspKeyContainerInfo.Exportable
+    }
+    if (-not $exportable) {
+        Stop-WithError "The private key of $($certificate.Thumbprint) is NOT exportable, so the service cannot use it." `
+            ("Re-import the PFX through this installer (-PfxPath imports with -Exportable). If the key must stay " +
+             "non-exportable, terminate TLS in IIS or HTTP.sys in front of the relay and set " +
+             "api.behind_tls_proxy = true instead - see README.md, 'Certificate sources'.")
+    }
+    $cryptoRoot = Join-Path $env:ProgramData 'Microsoft\Crypto'
+    $keyFile = $null
+    if ($uniqueName) {
+        $keyFile = Get-ChildItem -Path $cryptoRoot -Recurse -File -Filter $uniqueName -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $keyFile) {
+        Stop-WithError "Could not locate the private key file of $($certificate.Thumbprint) under $cryptoRoot." `
+            "Grant read access to $ServiceAccount by hand: certlm.msc > Personal > Certificates > right-click > All Tasks > Manage Private Keys."
+    }
+    # Same .NET route as above: icacls cannot address a virtual service SID.
+    try {
+        $keyAcl = Get-Acl -Path $keyFile.FullName
+        $keyAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sidObj,
+            [System.Security.AccessControl.FileSystemRights]::Read,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+        Set-Acl -Path $keyFile.FullName -AclObject $keyAcl
+    } catch {
+        Stop-WithError "Could not grant $ServiceAccount read access on the private key ($($keyFile.FullName))." $_.Exception.Message
+    }
+    Write-Ok "Private key readable by $ServiceAccount ($($keyFile.Name))"
+
+    # Point config.toml at the certificate: replace an existing (even commented)
+    # ssl_cert_thumbprint line, or add one directly under [api]. Character
+    # classes instead of '.' and '\s' so CRLF line endings survive the edit.
+    $thumbLine = "ssl_cert_thumbprint = `"$($certificate.Thumbprint)`""
+    # .NET IO on purpose: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI and
+    # its -Encoding UTF8 writes a BOM, which tomllib rejects. Read and write
+    # UTF-8 without BOM explicitly, on both PowerShell editions.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $content = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8)
+    if ($content -match '(?m)^[ \t]*#?[ \t]*ssl_cert_thumbprint[ \t]*=[^\r\n]*') {
+        $content = $content -replace '(?m)^[ \t]*#?[ \t]*ssl_cert_thumbprint[ \t]*=[^\r\n]*', $thumbLine
+    } elseif ($content -match '(?m)^\[api\][ \t]*$') {
+        $content = $content -replace '(?m)^\[api\][ \t]*$', "[api]`r`n$thumbLine"
+    } else {
+        $content = "[api]`r`n$thumbLine`r`n`r`n" + $content
+    }
+    [System.IO.File]::WriteAllText($configFile, $content, $utf8NoBom)
+    Write-Ok "config.toml: api.$thumbLine"
+    foreach ($other in @('ssl_certfile', 'ssl_pfxfile')) {
+        if ($content -match "(?m)^[ \t]*$other[ \t]*=") {
+            Write-Warn2 "config.toml also sets api.$other - the service refuses to start with two certificate sources. Remove one."
+        }
+    }
+    Write-Ok "Subject $($certificate.Subject), valid until $($certificate.NotAfter.ToString('yyyy-MM-dd'))"
+    Write-Warn2 "Remember: api.host must be non-loopback and api.token set for remote clients to use it."
+}
+
 # ------------------------------------------------------------------ firewall
 
 if ($OpenFirewall) {
@@ -492,6 +660,7 @@ Installation complete.
   Service name  : $ServiceName
   Runs as       : $ServiceAccount
   Runtime       : $Python (bundled CPython $runtimeVersion)
+  Certificate   : $(if ($certificate) { "$($certificate.Thumbprint) (Cert:\LocalMachine\My, until $($certificate.NotAfter.ToString('yyyy-MM-dd')))" } else { 'none - API serves plain HTTP on loopback' })
 
 Next steps:
   1. Edit the configuration:   notepad "$configFile"
@@ -505,8 +674,10 @@ private to this service.
 
 Exposing the API beyond this machine:
   - set api.host in config.toml to the interface you want (e.g. 0.0.0.0)
-  - set api.ssl_certfile / api.ssl_keyfile, and api.token or
-    api.ssl_cert_reqs = "required"
+  - give it a certificate: re-run install.ps1 -Force -PfxPath <file.pfx> (or
+    -CertThumbprint <existing>), or set api.ssl_certfile / api.ssl_keyfile or
+    api.ssl_pfxfile by hand
+  - set api.token (or api.ssl_cert_reqs = "required" for mutual TLS)
   - re-run install.ps1 with -OpenFirewall (or add the rule yourself)
 
 The application refuses to start if api.host is non-loopback without both TLS and

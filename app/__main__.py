@@ -16,6 +16,9 @@ def main() -> int:
     configure_stderr_logging()
     try:
         settings = load_config()
+        # Decodes a PKCS#12 / certificate-store source now, so a bad passphrase
+        # or a missing key is a config error here, not a traceback in uvicorn.
+        ssl_kwargs = settings.api.uvicorn_ssl_kwargs()
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -33,7 +36,7 @@ def main() -> int:
         create_app(settings),
         host=settings.api.host,
         port=settings.api.port,
-        **settings.api.uvicorn_ssl_kwargs(),
+        **ssl_kwargs,
     )
     return 0
 

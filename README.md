@@ -40,7 +40,10 @@ to build a payload with a missing transitive dependency.
 
 ### Dependencies
 
-Three runtime packages — `fastapi`, `uvicorn`, `pydantic[email]` — plus dev extras.
+Four runtime packages — `fastapi`, `uvicorn`, `pydantic[email]`, `cryptography` —
+plus dev extras. `cryptography` exists for the PKCS#12 and Windows-certificate-store
+[certificate sources](#certificate-sources); it is pinned to the 46.x line because
+47 and later publish no `win_arm64` wheel.
 
 `uvicorn` is deliberately installed **without** its `[standard]` extra. That extra
 pulls in `httptools`, `PyYAML`, `watchfiles`, `websockets`, `python-dotenv` and
@@ -50,9 +53,9 @@ WebSocket endpoint and no `.env` file.
 Excluding it matters on Windows. `PyYAML` publishes no `win_amd64` wheel for CPython
 3.15 and no `win_arm64` wheel for 3.11, so it turns `pip install` into a source
 build demanding **Visual Studio Build Tools for C++** — to compile a module the
-relay never imports. Without the extra, `pydantic-core` and `pywin32` are the only
-compiled dependencies and both have complete wheels, so **no C/C++ compiler is
-needed on any of win_amd64/win_arm64 × CPython 3.11–3.15**. uvicorn then serves
+relay never imports. Without the extra, `pydantic-core`, `pywin32`, `cffi` and
+`cryptography` are the only compiled dependencies and all have complete wheels, so
+**no C/C++ compiler is needed on any of win_amd64/win_arm64 × CPython 3.11–3.15**. uvicorn then serves
 over its pure-Python `h11` protocol instead of `httptools`, which is irrelevant at
 mail-relay volumes (verified live with 200 KB and 2 MB request bodies).
 
@@ -142,6 +145,9 @@ annotated template.
 | `RELAY_API_SSL_KEYFILE_PASSWORD` | `api.ssl_keyfile_password` |
 | `RELAY_API_SSL_CA_CERTS` | `api.ssl_ca_certs` |
 | `RELAY_API_SSL_CERT_REQS` | `api.ssl_cert_reqs` |
+| `RELAY_API_SSL_PFXFILE` | `api.ssl_pfxfile` |
+| `RELAY_API_SSL_PFX_PASSWORD` | `api.ssl_pfx_password` |
+| `RELAY_API_SSL_CERT_THUMBPRINT` | `api.ssl_cert_thumbprint` (Windows only) |
 | `RELAY_API_BEHIND_TLS_PROXY` | `api.behind_tls_proxy` |
 | `RELAY_SMTP_HOST` | `smtp.host` |
 | `RELAY_SMTP_PORT` | `smtp.port` |
@@ -192,8 +198,10 @@ binds `127.0.0.1`, so requests never leave the machine and encryption buys
 nothing. Enable it only if remote clients will connect to this process directly
 rather than through a reverse proxy.
 
-Setting `api.ssl_certfile` switches the endpoint to HTTPS — plaintext HTTP is then
-refused on that port, not served alongside it.
+Setting a certificate source — `api.ssl_certfile`, `api.ssl_pfxfile` or, on
+Windows, `api.ssl_cert_thumbprint` (see [Certificate sources](#certificate-sources))
+— switches the endpoint to HTTPS; plaintext HTTP is then refused on that port, not
+served alongside it. The PEM form:
 
 ```toml
 [api]
@@ -204,16 +212,21 @@ ssl_keyfile = "/etc/ssl/private/smtp-relay.key"
 
 | Key | Purpose |
 |---|---|
-| `api.ssl_certfile` | Server certificate chain. Its presence enables TLS. |
-| `api.ssl_keyfile` | Private key. Omit if the key is appended to the cert file. |
+| `api.ssl_certfile` | Server certificate chain in PEM. Its presence enables TLS. |
+| `api.ssl_keyfile` | Private key in PEM. Omit if the key is appended to the cert file. |
 | `api.ssl_keyfile_password` | Passphrase for an encrypted key. Prefer `RELAY_API_SSL_KEYFILE_PASSWORD`. |
+| `api.ssl_pfxfile` | A PKCS#12 file instead of the PEM pair. Its presence enables TLS. |
+| `api.ssl_pfx_password` | Its passphrase. Prefer `RELAY_API_SSL_PFX_PASSWORD`. |
+| `api.ssl_cert_thumbprint` | Windows only: a certificate in the machine store instead of any file. Its presence enables TLS. |
 | `api.ssl_ca_certs` | Client CA bundle, for mutual TLS. Must be paired with `ssl_cert_reqs`. |
 | `api.ssl_cert_reqs` | `none` \| `optional` \| `required` — mapped to `ssl.VerifyMode` for uvicorn. `optional`/`required` must be paired with `ssl_ca_certs`. |
 
 Two things are rejected at startup rather than failing obscurely later:
 
-- Setting any `ssl_*` key other than `ssl_certfile` without `ssl_certfile` — TLS
-  would not be enabled at all.
+- More than one certificate source, or a dependent key without its source:
+  `ssl_keyfile` / `ssl_keyfile_password` need `ssl_certfile`, `ssl_pfx_password`
+  needs `ssl_pfxfile`, and `ssl_ca_certs` / `ssl_cert_reqs` need some source —
+  otherwise TLS would not be enabled at all.
 - Setting `ssl_ca_certs` and `ssl_cert_reqs` **without each other.** uvicorn sets
   `verify_mode` unconditionally but loads the CA bundle only when `ssl_ca_certs` is
   given, so each alone is broken in a different way: a CA bundle with no
@@ -240,6 +253,66 @@ Clients then present a certificate chaining to `client-ca.pem`; anything else �
 no certificate, or one signed by a different CA — is refused during the TLS
 handshake, before any HTTP request is parsed.
 
+### Certificate sources
+
+Exactly one of three sources provides the server certificate and key:
+
+| Source | Key | Where the key lives | Passphrase at runtime |
+|---|---|---|---|
+| PEM files | `ssl_certfile` (+ `ssl_keyfile`) | two files you manage | only if the key file is encrypted |
+| PKCS#12 file | `ssl_pfxfile` | one `.pfx`/`.p12` file you manage | `ssl_pfx_password`, usually via the environment |
+| Windows certificate store | `ssl_cert_thumbprint` | `Cert:\LocalMachine\My`, DPAPI-protected, ACL'd to the service account | none |
+
+Python's TLS is OpenSSL, which reads PEM files natively but can neither parse
+PKCS#12 nor sign with a Windows CNG key handle. The other two sources are
+therefore decoded by `app/tls.py` with the `cryptography` package and loaded
+through the same file-based OpenSSL API as the PEM pair. For a few milliseconds
+at startup the key exists in a private temporary directory, PEM-encrypted under
+a random one-time passphrase that never leaves the process; the directory is
+removed as soon as the context is built. Decoding happens in the main thread
+before uvicorn starts, so a wrong passphrase or a missing key is reported as a
+configuration error (exit code 2, or an Event Log entry for the service), not
+as a traceback from a worker thread. The log also records subject, thumbprint
+and expiry of the certificate in use.
+
+**PKCS#12** works on every platform and in the container, and is what Windows
+CAs and most admins hand out, so no `openssl pkcs12` conversion is needed:
+
+```toml
+[api]
+host = "0.0.0.0"
+ssl_pfxfile = "/etc/ssl/private/smtp-relay.pfx"   # passphrase in RELAY_API_SSL_PFX_PASSWORD
+```
+
+**The Windows certificate store** is the natural home for a certificate on a
+Windows host: no key file, no passphrase in `config.toml` or the environment,
+renewal by re-import in `certlm.msc`, central visibility. `install.ps1` sets it
+up end to end:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -PfxPath C:\certs\relay.pfx -Start
+# or, for a certificate already in the store:
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -CertThumbprint 0123...CDEF -Start
+```
+
+With `-PfxPath` it asks for the passphrase once (never stored), imports the file
+into `Cert:\LocalMachine\My` with an **exportable** key, grants the service
+account read access on the key file — the same thing *Manage Private Keys* does
+in `certlm.msc` — and writes `api.ssl_cert_thumbprint` into `config.toml`. The
+PFX file can be deleted afterwards. With `-CertThumbprint` it does the grant and
+the config edit for an existing certificate, after checking that the key is
+exportable. Both are safe to repeat with `-Force`.
+
+At every start the service exports the certificate with its key through
+CryptoAPI (`PFXExportCertStoreEx`) into memory and loads it as above. That is
+why the key **must be exportable**, and why the honest description of this mode
+is "no key file to manage", not "non-exportable key": a local administrator can
+export it, just as they can read a key file. If the key must stay
+non-exportable, terminate TLS in IIS (with Application Request Routing) or in
+HTTP.sys in front of the relay, bind the store certificate there, forward to
+`127.0.0.1` over HTTP, and set [`api.behind_tls_proxy`](#behind-a-tls-terminating-reverse-proxy).
+A renewed certificate is picked up at the next service restart.
+
 ### Behind a TLS-terminating reverse proxy
 
 If a reverse proxy terminates TLS, leave `api.ssl_*` unset and have the proxy
@@ -261,8 +334,8 @@ behind_tls_proxy = true
 It waives **only the TLS half** of the rule. The proxy keeps the token off the
 public wire, but it does not stop anyone who can reach the relay's port from
 submitting mail, so `api.token` (or required mTLS) is still demanded and nothing
-waives that. Setting `behind_tls_proxy` together with `ssl_certfile` is rejected:
-TLS is terminated in exactly one place, and both set means one of them is
+waives that. Setting `behind_tls_proxy` together with any certificate source is
+rejected: TLS is terminated in exactly one place, and both set means one of them is
 misunderstood. The flag is only honest on a private network segment; do not use
 it to expose cleartext across a network you do not control.
 
@@ -625,7 +698,10 @@ per-user runtime under `%LOCALAPPDATA%`, a service running under its own account
 ends up depending on one user's profile.
 
 Switches: `-InstallDir`, `-ConfigDir`, `-ServiceName`, `-ServiceAccount`,
-`-ApiPort`, `-OpenFirewall`, `-Start`, `-Force`.
+`-ApiPort`, `-OpenFirewall`, `-Start`, `-Force`, and for the API certificate
+`-PfxPath` (+ optional `-PfxPassword` SecureString) or `-CertThumbprint` — see
+[Certificate sources](#certificate-sources). `uninstall.ps1` leaves the
+certificate in the store; remove it in `certlm.msc` if it is no longer wanted.
 
 `uninstall.ps1` stops and removes the service, deletes the install directory and
 the Apps & features entry, and **preserves** `C:\ProgramData\SmtpRelay` unless you
@@ -897,6 +973,7 @@ Three gotchas, all learned on a real Windows 11 ARM64 host:
 ```
 app/
   config.py           TOML + env configuration, validated by Pydantic
+  tls.py              server TLS context from a PKCS#12 file or the Windows certificate store
   schemas.py          Request/response models (structural validation -> 422)
   policy.py           Allowlist, base64 heuristic, recipient cap (-> 400)
   relay.py            MIME message building and SMTP delivery (-> 502)

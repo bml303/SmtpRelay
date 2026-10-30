@@ -184,6 +184,23 @@ def test_real_requirements_select_a_compiler_free_windows_set():
     assert "uvloop" not in names
     for standard_only in ("pyyaml", "httptools", "watchfiles", "websockets", "python-dotenv"):
         assert standard_only not in names, f"{standard_only} would force a source build"
+    # app/tls.py (PKCS#12 and the Windows certificate store) and its closure.
+    assert {"cryptography", "cffi", "pycparser"} <= names
+
+
+def test_cryptography_is_pinned_where_win_arm64_still_has_a_wheel():
+    """47+ publishes no win_arm64 wheel; a bump would break that payload's build.
+
+    The pin is deliberately one version for every target so each release has a
+    single SBOM entry for it. Lift this test when a newer win_arm64 wheel exists.
+    """
+    pins = {
+        line.split("==")[0].strip(): line.split("==")[1].split(";")[0].strip()
+        for line in (build_dist.PROJECT_ROOT / "requirements.txt").read_text().splitlines()
+        if "==" in line and not line.lstrip().startswith("#")
+    }
+    major = int(pins["cryptography"].split(".")[0])
+    assert major == 46, f"cryptography {pins['cryptography']}: check win_arm64 wheels before bumping"
 
 
 def test_payload_name_encodes_platform_and_python_tag():
@@ -545,6 +562,58 @@ def test_acl_failure_is_fatal_not_a_warning():
 
     assert "$aclFailures" in script
     assert "Stop-WithError" in script.split("$aclFailures.Count")[1][:400]
+
+
+def test_installer_imports_the_pfx_with_an_exportable_key():
+    """The service exports the key through CryptoAPI at start (OpenSSL cannot
+    use a CNG handle), so a non-exportable import would only fail at runtime."""
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
+
+    assert "Import-PfxCertificate" in script
+    assert "Exportable = $true" in script
+    assert "CertStoreLocation = $storePath" in script and "Cert:\\LocalMachine\\My" in script
+    # A pre-existing certificate (-CertThumbprint) is checked for the same property.
+    assert "CngExportPolicies]::AllowExport" in script
+    assert "CspKeyContainerInfo.Exportable" in script
+    assert "NOT exportable" in script
+
+
+def test_installer_grants_the_private_key_to_the_service_sid_via_dotnet():
+    """Same constraint as the directory ACLs: icacls cannot address a virtual
+    service SID, so the key file is granted through FileSystemAccessRule."""
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
+    step = script[script.index("API TLS certificate"):script.index("# ------------------------------------------------------------------ firewall")]
+
+    assert "Microsoft\\Crypto" in step, "key files live under ProgramData\\Microsoft\\Crypto"
+    assert "Key.UniqueName" in step and "UniqueKeyContainerName" in step, "both CNG and CAPI key files"
+    assert "FileSystemAccessRule" in step and "$sidObj" in step
+    assert "FileSystemRights]::Read" in step
+    assert not re.search(r"^\s*(&\s*)?icacls", step, re.M), "icacls must not be invoked on the key"
+
+
+def test_installer_points_config_at_the_imported_certificate():
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
+    step = script[script.index("API TLS certificate"):script.index("# ------------------------------------------------------------------ firewall")]
+
+    assert 'ssl_cert_thumbprint = `"$($certificate.Thumbprint)`"' in step
+    # Replaces a commented template line, else inserts under [api]; never duplicates.
+    assert "#?[ \\t]*ssl_cert_thumbprint" in step
+    assert "^\\[api\\][ \\t]*$" in step
+    # Warns about a conflicting second source instead of leaving a service that cannot start.
+    assert "'ssl_certfile', 'ssl_pfxfile'" in step
+
+
+def test_installer_validates_certificate_switches_before_changing_anything():
+    """A bad -PfxPath or thumbprint, or the passphrase prompt, must come before
+    the install directory is touched, so a typo cannot half-install the service."""
+    script = (build_dist.WINDOWS_INSTALLER_DIR / "install.ps1").read_text()
+
+    checks = script.index("-PfxPath and -CertThumbprint are mutually exclusive")
+    prompt = script.index("Read-Host -Prompt")
+    first_change = script.index('Write-Step "Preparing $InstallDir"')
+    assert checks < first_change and prompt < first_change
+    assert "-AsSecureString" in script, "the passphrase must not be read as plain text"
+    assert "[securestring] $PfxPassword" in script
 
 
 def test_uninstaller_uses_the_bundled_runtime():
