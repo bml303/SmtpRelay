@@ -136,31 +136,43 @@ jobs:
           if ($wanted -ne $actual) { throw "checksum mismatch for $($zip.Name): $wanted != $actual" }
           Expand-Archive $zip.FullName -DestinationPath payload
 
-          powershell -NoProfile -ExecutionPolicy Bypass -File payload/install.ps1 -Force -Start
+          # The zip keeps everything under one top-level folder; locate the installer
+          # instead of guessing its name, then work from inside the payload directory.
+          $installer = Get-ChildItem payload -Recurse -Filter install.ps1 | Select-Object -First 1
+          if (-not $installer) { throw "install.ps1 missing from the extracted payload" }
+          Push-Location $installer.DirectoryName
+          try {
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Force -Start
 
-          $deadline = (Get-Date).AddSeconds(30)
-          while ((Get-Service SmtpRelay).Status -ne 'Running') {
-            if ((Get-Date) -gt $deadline) { throw "service did not reach Running" }
-            Start-Sleep -Milliseconds 500
-          }
-          $version = ($tag -replace '^v', '')
-          $deadline = (Get-Date).AddSeconds(15)
-          while ($true) {
-            try {
-              $health = Invoke-RestMethod http://127.0.0.1:8000/health
-              break
-            } catch {
-              if ((Get-Date) -gt $deadline) { throw "/health never answered" }
+            $deadline = (Get-Date).AddSeconds(30)
+            while ($true) {
+              $svc = Get-Service SmtpRelay -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq 'Running') { break }
+              if ((Get-Date) -gt $deadline) { throw "service did not reach Running" }
               Start-Sleep -Milliseconds 500
             }
+
+            $version = ($tag -replace '^v', '')
+            $deadline = (Get-Date).AddSeconds(15)
+            while ($true) {
+              try {
+                $health = Invoke-RestMethod http://127.0.0.1:8000/health
+                break
+              } catch {
+                if ((Get-Date) -gt $deadline) { throw "/health never answered" }
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            $body = $health | ConvertTo-Json -Compress
+            if ($body -notlike "*$version*") { throw "/health does not report $version : $body" }
+            Write-Host "/health OK: $body"
+            Get-EventLog -LogName Application -Source SmtpRelay -Newest 5 | Format-List TimeGenerated, Message
+
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
+          } finally {
+            Pop-Location
           }
-          if ($health.version -ne $version) { throw "/health says '$($health.version)', expected $version" }
-          Write-Host "/health OK: $($health | ConvertTo-Json -Compress)"
-          Get-EventLog -LogName Application -Source SmtpRelay -Newest 5 | Format-List TimeGenerated, Message
-
-          powershell -NoProfile -ExecutionPolicy Bypass -File payload/uninstall.ps1
           if (Get-Service SmtpRelay -ErrorAction SilentlyContinue) { throw "service survived uninstall.ps1" }
-
   image:
     # After payloads: both jobs touch the same release, and only the payloads
     # job creates it, so the SHA256SUMS fold below always finds it.
