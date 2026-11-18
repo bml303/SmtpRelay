@@ -2,6 +2,8 @@
 #
 #   tests  ->  payloads  (Windows zips, Linux tarballs, one CycloneDX SBOM per payload,
 #                         SHA256SUMS, attached to the GitHub release)
+#          ->  windows-smoke (installs the win_amd64 payload from the release on
+#                         amd64 Windows runner, health-checks the service, uninstalls)
 #          ->  image     (multi-arch container pushed to ghcr.io/<owner>/smtprelay:vX.Y.Z,
 #                         plus a syft SBOM per architecture attached to the same release)
 #
@@ -105,6 +107,59 @@ jobs:
           fi
           gh release upload "$tag" --clobber \
             dist/SmtpRelay-*.zip dist/SmtpRelay-*.tar.gz dist/SmtpRelay-*.cdx.json dist/SHA256SUMS
+
+  windows-smoke:
+    # Smoke-test the released payload exactly as an operator installs it: pull the
+    # win_amd64 zip from the just-created release, check its SHA256SUMS line, run
+    # install.ps1, wait for Running, read /health, then uninstall. amd64 only: the
+    # hosted runner is amd64 and covers everything win_arm64 shares with it (the
+    # scripts, service registration, ACLs); the arm64 wheel closure itself is
+    # already verified by build_dist.py in the payloads job.
+    needs: payloads
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the win_amd64 payload from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          gh release download $tag --pattern SHA256SUMS --dir dist --clobber
+          gh release download $tag --pattern 'SmtpRelay-*-win_amd64-cp315.zip' --dir dist --clobber
+          $zip = Get-ChildItem dist -Filter 'SmtpRelay-*-win_amd64-cp315.zip' | Select-Object -First 1
+          if (-not $zip) { throw "the win_amd64 payload is not attached to release $tag" }
+          $wanted = ((Select-String -Path dist/SHA256SUMS -Pattern ([regex]::Escape($zip.Name))).Line -split '\s+')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLowerInvariant()
+          if ($wanted -ne $actual) { throw "checksum mismatch for $($zip.Name): $wanted != $actual" }
+          Expand-Archive $zip.FullName -DestinationPath payload
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File payload/install.ps1 -Force -Start
+
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Get-Service SmtpRelay).Status -ne 'Running') {
+            if ((Get-Date) -gt $deadline) { throw "service did not reach Running" }
+            Start-Sleep -Milliseconds 500
+          }
+          $version = ($tag -replace '^v', '')
+          $deadline = (Get-Date).AddSeconds(15)
+          while ($true) {
+            try {
+              $health = Invoke-RestMethod http://127.0.0.1:8000/health
+              break
+            } catch {
+              if ((Get-Date) -gt $deadline) { throw "/health never answered" }
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if ($health.version -ne $version) { throw "/health says '$($health.version)', expected $version" }
+          Write-Host "/health OK: $($health | ConvertTo-Json -Compress)"
+          Get-EventLog -LogName Application -Source SmtpRelay -Newest 5 | Format-List TimeGenerated, Message
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File payload/uninstall.ps1
+          if (Get-Service SmtpRelay -ErrorAction SilentlyContinue) { throw "service survived uninstall.ps1" }
 
   image:
     # After payloads: both jobs touch the same release, and only the payloads
