@@ -25,12 +25,12 @@ anyio==4.16.0
 cffi==2.1.1
 click==8.5.1
 # cryptography decodes PKCS#12 (api.ssl_pfxfile) and the Windows certificate
-# store export (api.ssl_cert_thumbprint); see app/tls.py. 46.0.7 is the last
+# store export (api.ssl_cert_thumbprint); see app/tls.py. 46.0.3 is the last
 # release with a win_arm64 wheel - 47+ ships none - so it is pinned there for
 # every target to keep one SBOM entry per package. Revisit when
 #   pip index versions cryptography --platform win_arm64 --python-version 3.15 --only-binary=:all:
 # lists something newer.
-cryptography==46.0.7
+cryptography==46.0.3
 dnspython==2.9.2
 email-validator==2.4.0
 fastapi==0.163.2
